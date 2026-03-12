@@ -73,7 +73,10 @@ DONE_STATIC_INFO = False
 alternative_interpreter = None
 
 def reset_car():
-    ac.ext_resetCar()
+    if hasattr(ac, "ext_resetCar"):
+        ac.ext_resetCar()
+    else:
+        logger.warning("[MAIN] CSP reset API unavailable; skipping reset_car().")
     if controls:
         controls.set_controls(0, -1, -1)
 
@@ -252,26 +255,26 @@ def acUpdate(deltaT):
         telemetry.set_static_info(static_info.export())
         return
 
-    if ac.ext_isAltPressed():
-        if ac.ext_isButtonPressed("W"):
+    if hasattr(ac, "ext_isAltPressed") and ac.ext_isAltPressed():
+        if hasattr(ac, "ext_isButtonPressed") and ac.ext_isButtonPressed("W") and hasattr(ac, "ext_takeAStepBack"):
             ac.ext_takeAStepBack() # same as reset
             logger.info("[MAIN] Step back.")
 
-        if ac.ext_isButtonPressed("R"):
+        if hasattr(ac, "ext_isButtonPressed") and ac.ext_isButtonPressed("R"):
             if telemetry.recording:
                 telemetry.stop_recording()
                 telemetry.save_telemetry()
                 logger.info("[MAIN] Stop recording.")
 
-        if ac.ext_isButtonPressed("E"):
+        if hasattr(ac, "ext_isButtonPressed") and ac.ext_isButtonPressed("E"):
             if not telemetry.recording:
                 logger.info("[MAIN] Start recording.")
                 telemetry.start_recording()
 
-        if ac.ext_isButtonPressed("R"):
+        if hasattr(ac, "ext_isButtonPressed") and ac.ext_isButtonPressed("R"):
             reset_car()
 
-        if ac.ext_isButtonPressed("T"):
+        if hasattr(ac, "ext_isButtonPressed") and ac.ext_isButtonPressed("T"):
             #log_message("Car: {}".format(ac.getCarName(car.car_id)))
             if controls:
                 controls.set_controls(.01, 5., -1)

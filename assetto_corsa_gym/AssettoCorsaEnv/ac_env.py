@@ -1,5 +1,6 @@
 import os
 import sys
+import subprocess
 import numpy as np
 import pandas as pd
 import pickle
@@ -625,6 +626,69 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.client.respond_to_server()
         self.client.simulation_management.send_reset()
 
+    def _ensure_drive_gear_after_reset(self, launch_timeout_seconds=4.0):
+        state = self.client.state.copy()
+        gear = state.get("actualGear", 2)
+
+        if gear > 1:
+            return
+
+        logger.info("Reset landed in neutral. Applying sustained throttle until the auto-shifter engages first gear.")
+        deadline = time.perf_counter() + launch_timeout_seconds
+        attempt = 0
+        while time.perf_counter() < deadline:
+            attempt += 1
+            self.client.controls.set_controls(steer=0.0, acc=1.0, brake=-1.0)
+            self.client.respond_to_server()
+            state = self.client.step_sim()
+            gear = state.get("actualGear", 2)
+            speed = state.get("speed", 0.0)
+
+            if attempt == 1 or attempt % 10 == 0 or gear > 1:
+                logger.info(
+                    "Launch assist step %d actualGear=%s speed=%.3f acc=%.3f clutch=%.3f rpm=%.0f",
+                    attempt,
+                    gear,
+                    speed,
+                    state.get("accStatus", 0.0),
+                    state.get("actualClutch", state.get("clutch", 0.0)),
+                    state.get("RPM", 0.0),
+                )
+
+            if gear > 1 and speed > 0.5:
+                self.client.controls.set_defaults()
+                self.client.respond_to_server()
+                return
+
+        self.client.controls.set_defaults()
+        self.client.respond_to_server()
+
+        logger.warning("The car is still in neutral after launch assist.")
+        launcher_script = Path(__file__).resolve().parents[3] / "start_acgym_supported.ps1"
+        if not launcher_script.exists():
+            return
+
+        logger.warning("Relaunching the full AC session to recover from a stuck reset.")
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(launcher_script),
+                "-SkipWatcher",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=240,
+        )
+        if result.returncode != 0:
+            logger.warning("Launcher recovery failed: %s", result.stderr.strip())
+            return
+
+        self.client.reset(False)
+
     def reset(self, seed=None, verbose=False):
         self.end_of_episode_stats()
         self.stats_saved = False
@@ -661,6 +725,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             assert self.static_info["CarName"] == self.car_name, f"Track name mismatch. Running: {self.static_info['CarName']} Configured: {self.car_name}"
 
         self.client.reset(self.send_reset_at_start)
+        self._ensure_drive_gear_after_reset()
 
         self.termination_counter = int(TERMINAL_JUDGE_TIMEOUT * self.ctrl_rate)
         self.episode_saved = False
