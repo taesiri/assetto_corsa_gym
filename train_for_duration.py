@@ -4,6 +4,7 @@ import argparse
 import logging
 import time
 import json
+import pickle
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +27,17 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train AssettoCorsaGym for a fixed wall-clock duration.")
     parser.add_argument("--config", default="config.yml", type=str, help="Path to configuration file")
     parser.add_argument("--load_path", type=str, default=None, help="Model directory to resume from")
+    parser.add_argument(
+        "--load-buffer",
+        action="store_true",
+        help="Load replay_buffer.pkl from --load_path unless --buffer-path is provided",
+    )
+    parser.add_argument(
+        "--buffer-path",
+        type=str,
+        default=None,
+        help="Directory containing replay_buffer.pkl, or a direct path to replay_buffer.pkl",
+    )
     parser.add_argument("--algo", type=str, default="sac", help="Algorithm type")
     parser.add_argument("--duration-hours", type=float, default=3.0, help="Wall-clock budget in hours")
     parser.add_argument(
@@ -37,6 +49,7 @@ def parse_args():
     parser.add_argument("overrides", nargs=argparse.REMAINDER, help="Hydra-style key=value overrides")
     args = parser.parse_args()
     args.load_path = os.path.abspath(args.load_path) + os.sep if args.load_path is not None else None
+    args.buffer_path = os.path.abspath(args.buffer_path) if args.buffer_path is not None else None
     args.seed_laps_dir = [os.path.abspath(path) for path in args.seed_laps_dir]
     return args
 
@@ -71,6 +84,18 @@ def build_algo(args, env, config, device):
             **OmegaConf.to_container(config.SAC),
         )
     raise ValueError("algo must be 'sac' or 'discor'")
+
+
+def load_replay_buffer(agent, path):
+    buffer_file = path
+    if os.path.isdir(buffer_file):
+        buffer_file = os.path.join(buffer_file, "replay_buffer.pkl")
+
+    with open(buffer_file, "rb") as handle:
+        agent._replay_buffer = pickle.load(handle)
+
+    agent._steps = agent._replay_buffer._n
+    logger.info("Loaded replay buffer from %s. Number of steps: %d", buffer_file, len(agent._replay_buffer))
 
 
 def write_run_summary(path, started_at, duration_hours, requested_deadline, seed_dirs, agent):
@@ -136,6 +161,8 @@ def main():
 
     if args.load_path is not None:
         agent.load(args.load_path, load_buffer=False)
+    if args.load_buffer or args.buffer_path is not None:
+        load_replay_buffer(agent, args.buffer_path or args.load_path)
 
     for seed_dir in args.seed_laps_dir:
         logger.info("Seeding replay buffer from %s", seed_dir)
