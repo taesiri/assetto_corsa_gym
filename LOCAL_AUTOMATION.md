@@ -29,6 +29,7 @@ This checkout has local scripts and code changes for running AssettoCorsaGym una
 The stock-launcher automation lives outside this checkout at:
 
 - [start_acgym_supported.ps1](C:/Workspace/RacingSim/start_acgym_supported.ps1)
+- [scripts](C:/Workspace/RacingSim/scripts)
 
 That script:
 
@@ -42,6 +43,14 @@ That script:
 - enters cockpit view,
 - can optionally skip the watcher with `-SkipWatcher`.
 
+The root wrapper scripts provide the normal operator entrypoints:
+
+- [Run-Game.ps1](C:/Workspace/RacingSim/scripts/Run-Game.ps1)
+- [Smoke-Test.ps1](C:/Workspace/RacingSim/scripts/Smoke-Test.ps1)
+- [Train-LiveAgent.ps1](C:/Workspace/RacingSim/scripts/Train-LiveAgent.ps1)
+- [Resume-LiveAgent.ps1](C:/Workspace/RacingSim/scripts/Resume-LiveAgent.ps1)
+- [Plot-Run.ps1](C:/Workspace/RacingSim/scripts/Plot-Run.ps1)
+
 ## Typical Flow
 
 Launch the game:
@@ -50,16 +59,35 @@ Launch the game:
 powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\start_acgym_supported.ps1
 ```
 
+or:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Run-Game.ps1
+```
+
 Smoke test:
 
 ```powershell
 C:\Workspace\RacingSim\.venv-acgym\Scripts\python.exe C:\Workspace\RacingSim\assetto_corsa_gym\smoke_random.py
 ```
 
+or:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Smoke-Test.ps1
+```
+
 Short live SAC run:
 
 ```powershell
 C:\Workspace\RacingSim\.venv-acgym\Scripts\python.exe C:\Workspace\RacingSim\assetto_corsa_gym\train.py disable_wandb=True Agent.num_steps=20000 Agent.memory_size=50000 Agent.offline_buffer_size=0 Agent.start_steps=1000 Agent.batch_size=64 AssettoCorsa.track=monza AssettoCorsa.car=ks_mazda_miata
+```
+
+or with the generic live-agent wrapper:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Train-LiveAgent.ps1 -Algo sac -NumSteps 20000
+powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Train-LiveAgent.ps1 -Algo discor -NumSteps 20000
 ```
 
 Plot a finished live run:
@@ -72,6 +100,12 @@ Continue training for a fixed time budget from an existing model:
 
 ```powershell
 C:\Workspace\RacingSim\.venv-acgym\Scripts\python.exe C:\Workspace\RacingSim\assetto_corsa_gym\train_for_duration.py --load_path C:\Workspace\RacingSim\assetto_corsa_gym\outputs\RUN_DIR\model\final --duration-hours 3 --seed-laps-dir C:\Workspace\RacingSim\assetto_corsa_gym\outputs\RUN_DIR\laps disable_wandb=True AssettoCorsa.track=monza AssettoCorsa.car=ks_mazda_miata
+```
+
+or:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Resume-LiveAgent.ps1 -Algo sac -DurationHours 3
 ```
 
 ## Verified Run Outputs
