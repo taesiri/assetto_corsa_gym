@@ -74,13 +74,48 @@ class GaussianPolicy(BaseNetwork):
     LOG_STD_MAX = 2
     LOG_STD_MIN = -20
 
-    def __init__(self, state_dim, action_dim, hidden_units=[256, 256]):
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        hidden_units=[256, 256],
+        policy_mean_bias=None,
+        policy_log_std_bias=None,
+    ):
         super().__init__()
+        self.action_dim = action_dim
 
         self.net = create_linear_network(
             input_dim=state_dim,
             output_dim=2*action_dim,
             hidden_units=hidden_units)
+        self._apply_output_bias(policy_mean_bias, policy_log_std_bias)
+
+    def _apply_output_bias(self, policy_mean_bias, policy_log_std_bias):
+        if policy_mean_bias is None and policy_log_std_bias is None:
+            return
+
+        output_layer = None
+        for layer in reversed(self.net):
+            if isinstance(layer, nn.Linear):
+                output_layer = layer
+                break
+
+        if output_layer is None or output_layer.bias is None:
+            return
+
+        with torch.no_grad():
+            if policy_mean_bias is not None:
+                mean_bias = torch.as_tensor(policy_mean_bias, dtype=output_layer.bias.dtype)
+                if mean_bias.numel() != self.action_dim:
+                    raise ValueError("policy_mean_bias must match action_dim")
+                output_layer.bias[:self.action_dim].copy_(mean_bias)
+
+            if policy_log_std_bias is not None:
+                log_std_bias = torch.as_tensor(policy_log_std_bias, dtype=output_layer.bias.dtype)
+                if log_std_bias.numel() != self.action_dim:
+                    raise ValueError("policy_log_std_bias must match action_dim")
+                output_layer.bias[self.action_dim:].copy_(log_std_bias)
 
     def forward(self, states):
         assert states.dim() == 2

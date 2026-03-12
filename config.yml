@@ -38,6 +38,8 @@ SAC:
   q_lr: 0.0003
   entropy_lr: 0.0003
   policy_hidden_units: [256, 256, 256]
+  policy_mean_bias: [0.0, 0.35, -0.25]
+  policy_log_std_bias: [-2.0, -1.0, -1.4]
   q_hidden_units: [256, 256, 256]
   target_update_coef: 0.005
   log_interval: 10
@@ -77,6 +79,16 @@ AssettoCorsa:
   add_previous_obs_to_state: True
   use_reference_line_in_reward: True
   use_target_speed: False
+  use_action_prior_sampling: True
+  action_prior_mean: [0.0, 0.55, -0.9]
+  action_prior_std: [0.08, 0.18, 0.06]
+  use_state_action_bias: True
+  action_bias_curvature_scale: 0.02
+  action_bias_gap_scale: 3.0
+  action_bias_steer_base: 0.65
+  action_bias_throttle_delta: 0.14
+  action_bias_brake_delta: 0.22
+  action_bias_brake_release: 0.28
   screen_capture_enable: False
   # This should be a multiple of the resolution set in Assetto Corsa to avoid cropping and padding
   # AC configured Using 640x480

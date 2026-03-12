@@ -146,9 +146,14 @@ class Agent:
             while (not done):
                 start_profile = time.perf_counter()
                 if self._start_steps > self._steps:
-                    action = self._env.action_space.sample()
+                    if hasattr(self._env, "sample_exploration_action"):
+                        action = self._env.sample_exploration_action()
+                    else:
+                        action = self._env.action_space.sample()
                 else:
                     action, _ = self._algo.explore(state)
+                if hasattr(self._env, "bias_action"):
+                    action = self._env.bias_action(action)
                 action_perf.append(time.perf_counter() - start_profile)
 
                 # apply actions right away without blocking

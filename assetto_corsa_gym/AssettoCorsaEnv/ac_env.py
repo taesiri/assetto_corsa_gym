@@ -243,6 +243,16 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.max_steer_rate = self.config.max_steer_rate
         self.use_obs_extra = self.config.use_obs_extra
         self.use_reference_line_in_reward = self.config.use_reference_line_in_reward
+        self.use_action_prior_sampling = bool(self.config.get("use_action_prior_sampling", False))
+        self.action_prior_mean = np.array(self.config.get("action_prior_mean", [0.0, 0.0, 0.0]), dtype=np.float32)
+        self.action_prior_std = np.array(self.config.get("action_prior_std", [1.0, 1.0, 1.0]), dtype=np.float32)
+        self.use_state_action_bias = bool(self.config.get("use_state_action_bias", False))
+        self.action_bias_curvature_scale = float(self.config.get("action_bias_curvature_scale", 0.02))
+        self.action_bias_gap_scale = float(self.config.get("action_bias_gap_scale", 3.0))
+        self.action_bias_steer_base = float(self.config.get("action_bias_steer_base", 1.0))
+        self.action_bias_throttle_delta = float(self.config.get("action_bias_throttle_delta", 0.0))
+        self.action_bias_brake_delta = float(self.config.get("action_bias_brake_delta", 0.0))
+        self.action_bias_brake_release = float(self.config.get("action_bias_brake_release", 0.0))
 
         # from the config
         self.use_ac_out_of_track = self.config.use_ac_out_of_track
@@ -395,6 +405,50 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.metadata = {'render.modes': ['human', 'rgb_array'], 'video.frames_per_second': 30}
 
         self.is_metaworld = False
+
+    def sample_exploration_action(self):
+        if not self.use_action_prior_sampling:
+            return self.action_space.sample().astype(np.float32)
+
+        action = np.random.normal(self.action_prior_mean, self.action_prior_std).astype(np.float32)
+        action = np.clip(action, self.action_space.low, self.action_space.high)
+
+        # Prefer free-rolling over simultaneous throttle and brake during warmup.
+        if action[1] > -0.1 and action[2] > -0.1:
+            action[2] = min(action[2], -0.75)
+
+        return action
+
+    def bias_action(self, action):
+        if not self.use_state_action_bias:
+            return action
+
+        state = getattr(self, "state", None)
+        if not state or "LapDist" not in state:
+            return action
+
+        curvature_segment = self.ref_lap.get_curvature_segment(
+            state["LapDist"], CURV_LOOK_AHEAD_DISTANCE, CURV_LOOK_AHEAD_VECTOR_SIZE
+        )
+        curvature_ratio = np.clip(
+            np.max(np.abs(curvature_segment)) / max(self.action_bias_curvature_scale, 1e-6),
+            0.0,
+            1.0,
+        )
+        gap_ratio = np.clip(np.abs(state.get("gap", 0.0)) / max(self.action_bias_gap_scale, 1e-6), 0.0, 1.0)
+
+        biased = np.array(action, dtype=np.float32, copy=True)
+        steer_scale = self.action_bias_steer_base + (1.0 - self.action_bias_steer_base) * curvature_ratio
+        biased[0] *= steer_scale
+        biased[1] += self.action_bias_throttle_delta * (1.0 - curvature_ratio) * (1.0 - 0.75 * gap_ratio)
+        biased[2] += self.action_bias_brake_delta * curvature_ratio
+        biased[2] -= self.action_bias_brake_release * (1.0 - curvature_ratio)
+
+        # Avoid riding the brake while the prior is trying to open the throttle.
+        if biased[1] > 0.15:
+            biased[2] = min(biased[2], -0.3)
+
+        return np.clip(biased, self.action_space.low, self.action_space.high).astype(np.float32)
 
     def set_reset_state(self, send_reset_at_start):
         self.send_reset_at_start = send_reset_at_start
