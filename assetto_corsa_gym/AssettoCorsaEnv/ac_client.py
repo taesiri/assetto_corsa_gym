@@ -85,6 +85,12 @@ class Client():
             self.joystick_handler = JoystickHandler()
             self.joystick_handler.initialize()
 
+    def reinitialize_local_controls(self):
+        if self.vjoy_executed_by_server:
+            return
+        if hasattr(self.controls, "reinitialize_local_controls"):
+            self.controls.reinitialize_local_controls()
+
     def reply_to_server(self, msg):
         if not self.socket:
             return
@@ -247,6 +253,16 @@ class DriverControls(dict):
             logger.warning("Controls will be executed locally and not by the server")
             self.local_controls = Controls()
 
+    def reinitialize_local_controls(self):
+        if self.vjoy_executed_by_server:
+            return
+        try:
+            self.local_controls.close()
+        except Exception:
+            logger.debug("Closing local controls during reinitialization failed", exc_info=True)
+        self.local_controls = Controls()
+        self.set_defaults()
+
     def set_defaults(self):
         # steer, acc and brake are in the range [-1, 1]
         self["steer"] = 0
@@ -265,12 +281,14 @@ class DriverControls(dict):
         self["shift_down"] = shift_down
 
     def apply_local_controls(self):
-        self.local_controls.set_controls(steer=self["steer"],
-                                         acc=self["acc"],
-                                         brake=self["brake"],
-                                         enable_gear_shift=self["enable_gear_shift"],
-                                         shift_up=self["shift_up"],
-                                         shift_down=self["shift_down"])
+        ok = self.local_controls.set_controls(steer=self["steer"],
+                                              acc=self["acc"],
+                                              brake=self["brake"],
+                                              enable_gear_shift=self["enable_gear_shift"],
+                                              shift_up=self["shift_up"],
+                                              shift_down=self["shift_down"])
+        if ok is False:
+            logger.warning("Local controls update reported failure.")
 
     def export(self):
         return json.dumps(self)

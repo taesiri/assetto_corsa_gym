@@ -1,8 +1,11 @@
 import ctypes
 import struct, time
 import math
+import logging
 
 CONST_DLL_VJOY = "C:\\Program Files\\vJoy\\x64\\vJoyInterface.dll"
+
+logger = logging.getLogger(__name__)
 
 class vJoy(object):
     def __init__(self, reference=1):
@@ -12,14 +15,19 @@ class vJoy(object):
         self.acquired = False
 
     def open(self):
+        if self.acquired:
+            return True
         if self.dll.AcquireVJD(self.reference):
             self.acquired = True
+            logger.info("Acquired vJoy device %s", self.reference)
             return True
+        logger.warning("Failed to acquire vJoy device %s", self.reference)
         return False
 
     def close(self):
         if self.dll.RelinquishVJD(self.reference):
             self.acquired = False
+            logger.info("Released vJoy device %s", self.reference)
             return True
         return False
 
@@ -69,6 +77,11 @@ class vJoy(object):
 
     def update(self, joystickPosition):
         if self.dll.UpdateVJD(self.reference, joystickPosition):
+            return True
+        self.acquired = False
+        logger.warning("UpdateVJD failed for vJoy device %s. Attempting to reacquire.", self.reference)
+        if self.open() and self.dll.UpdateVJD(self.reference, joystickPosition):
+            logger.info("Recovered vJoy device %s after failed update.", self.reference)
             return True
         return False
 

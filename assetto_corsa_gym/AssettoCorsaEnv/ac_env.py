@@ -73,6 +73,10 @@ def convert_to_seconds(time_str):
 
     return minutes * 60 + seconds + milliseconds / 1000
 
+
+def wrap_to_pi(angle):
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
 class TaskIdsIndexer:
     def __init__(self, tracks, cars):
         self.tracks = tracks
@@ -253,6 +257,36 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         self.action_bias_throttle_delta = float(self.config.get("action_bias_throttle_delta", 0.0))
         self.action_bias_brake_delta = float(self.config.get("action_bias_brake_delta", 0.0))
         self.action_bias_brake_release = float(self.config.get("action_bias_brake_release", 0.0))
+        self.use_heuristic_speed_reward = bool(self.config.get("use_heuristic_speed_reward", False))
+        self.heuristic_target_speed_min = float(self.config.get("heuristic_target_speed_min", 12.0))
+        self.heuristic_target_speed_max = float(self.config.get("heuristic_target_speed_max", 45.0))
+        self.heuristic_target_speed_curvature_scale = float(
+            self.config.get("heuristic_target_speed_curvature_scale", 0.02)
+        )
+        self.heuristic_target_speed_power = float(self.config.get("heuristic_target_speed_power", 0.75))
+        self.overspeed_margin = float(self.config.get("overspeed_margin", 1.5))
+        self.overspeed_penalty_coef = float(self.config.get("overspeed_penalty_coef", 0.0))
+        self.overspeed_penalty_power = float(self.config.get("overspeed_penalty_power", 1.0))
+        self.turn_gap_penalty_coef = float(self.config.get("turn_gap_penalty_coef", 0.0))
+        self.heading_error_penalty_coef = float(self.config.get("heading_error_penalty_coef", 0.0))
+        self.steer_change_penalty_coef = float(self.config.get("steer_change_penalty_coef", 0.0))
+        self.action_bias_overspeed_window = float(self.config.get("action_bias_overspeed_window", 6.0))
+        self.action_bias_overspeed_throttle_cut = float(
+            self.config.get("action_bias_overspeed_throttle_cut", 0.0)
+        )
+        self.action_bias_overspeed_brake_gain = float(
+            self.config.get("action_bias_overspeed_brake_gain", 0.0)
+        )
+        self.use_reference_steer_bias = bool(self.config.get("use_reference_steer_bias", False))
+        self.reference_steer_lookahead = float(self.config.get("reference_steer_lookahead", 18.0))
+        self.reference_steer_gain = float(self.config.get("reference_steer_gain", 0.85))
+        self.reference_steer_yaw_rate_gain = float(self.config.get("reference_steer_yaw_rate_gain", 0.18))
+        self.reference_steer_lateral_gain = float(self.config.get("reference_steer_lateral_gain", 0.035))
+        self.reference_steer_blend = float(self.config.get("reference_steer_blend", 0.55))
+        self.reference_steer_speed_min = float(self.config.get("reference_steer_speed_min", 12.0))
+        self.use_turn_speed_control_bias = bool(self.config.get("use_turn_speed_control_bias", False))
+        self.turn_throttle_cap_gain = float(self.config.get("turn_throttle_cap_gain", 0.70))
+        self.turn_brake_floor_gain = float(self.config.get("turn_brake_floor_gain", 0.45))
 
         # from the config
         self.use_ac_out_of_track = self.config.use_ac_out_of_track
@@ -308,6 +342,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             self.target_speed = self.ref_lap.get_channel_time("target_speed")
 
         self.ref_lap_dist_channel_time = self.ref_lap.get_channel_time("lapDistance")
+        self.ref_yaw_dist = self.ref_lap.get_channel_dist("yaw").reshape(-1)
 
         if self.enable_sensors:
             self.sensors = sensors_ray_casting.SensorsRayCasting(self.track.right_border_x, self.track.right_border_y,
@@ -419,6 +454,40 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
 
         return action
 
+    def get_corner_guidance(self, lap_dist, speed=None):
+        curvature_segment = self.ref_lap.get_curvature_segment(
+            lap_dist, CURV_LOOK_AHEAD_DISTANCE, CURV_LOOK_AHEAD_VECTOR_SIZE
+        )
+        curvature_peak = float(np.max(np.abs(curvature_segment))) if len(curvature_segment) else 0.0
+        curvature_ratio = np.clip(
+            curvature_peak / max(self.heuristic_target_speed_curvature_scale, 1e-6),
+            0.0,
+            1.0,
+        )
+        target_speed = self.heuristic_target_speed_max - (
+            (self.heuristic_target_speed_max - self.heuristic_target_speed_min)
+            * np.power(curvature_ratio, self.heuristic_target_speed_power)
+        )
+        target_speed = float(
+            np.clip(target_speed, self.heuristic_target_speed_min, self.heuristic_target_speed_max)
+        )
+
+        overspeed_error = 0.0
+        if speed is not None:
+            overspeed_error = max(0.0, float(speed) - target_speed - self.overspeed_margin)
+
+        return curvature_segment, curvature_peak, curvature_ratio, target_speed, overspeed_error
+
+    def get_reference_yaw(self, lap_dist):
+        yaw_vec, _, _ = self.ref_lap.getLADVector(
+            self.ref_lap.distance_ch_dist,
+            lap_dist,
+            self.reference_steer_lookahead,
+            1,
+            self.ref_yaw_dist,
+        )
+        return float(yaw_vec[0])
+
     def bias_action(self, action):
         if not self.use_state_action_bias:
             return action
@@ -427,26 +496,84 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         if not state or "LapDist" not in state:
             return action
 
-        curvature_segment = self.ref_lap.get_curvature_segment(
-            state["LapDist"], CURV_LOOK_AHEAD_DISTANCE, CURV_LOOK_AHEAD_VECTOR_SIZE
+        (
+            _curvature_segment,
+            curvature_peak,
+            _guidance_curvature_ratio,
+            target_speed,
+            overspeed_error,
+        ) = self.get_corner_guidance(
+            state["LapDist"],
+            speed=state.get("speed"),
         )
         curvature_ratio = np.clip(
-            np.max(np.abs(curvature_segment)) / max(self.action_bias_curvature_scale, 1e-6),
+            curvature_peak / max(self.action_bias_curvature_scale, 1e-6),
             0.0,
             1.0,
         )
         gap_ratio = np.clip(np.abs(state.get("gap", 0.0)) / max(self.action_bias_gap_scale, 1e-6), 0.0, 1.0)
+        overspeed_ratio = np.clip(
+            overspeed_error / max(self.action_bias_overspeed_window, 1e-6),
+            0.0,
+            1.0,
+        )
+        speed = float(state.get("speed", 0.0))
+        speed_ratio = np.clip(speed / max(target_speed, 1e-6), 0.0, 2.0)
 
         biased = np.array(action, dtype=np.float32, copy=True)
-        steer_scale = self.action_bias_steer_base + (1.0 - self.action_bias_steer_base) * curvature_ratio
+        corner_ratio = max(curvature_ratio, overspeed_ratio)
+        steer_scale = self.action_bias_steer_base + (1.0 - self.action_bias_steer_base) * corner_ratio
         biased[0] *= steer_scale
         biased[1] += self.action_bias_throttle_delta * (1.0 - curvature_ratio) * (1.0 - 0.75 * gap_ratio)
+        biased[1] -= self.action_bias_overspeed_throttle_cut * overspeed_ratio
         biased[2] += self.action_bias_brake_delta * curvature_ratio
-        biased[2] -= self.action_bias_brake_release * (1.0 - curvature_ratio)
+        biased[2] += self.action_bias_overspeed_brake_gain * overspeed_ratio
+        biased[2] -= self.action_bias_brake_release * (1.0 - curvature_ratio) * (1.0 - overspeed_ratio)
+
+        if self.use_reference_steer_bias:
+            heading_error = float(state.get("heading_error", 0.0))
+            yaw_rate = float(state.get("angular_velocity_y", 0.0))
+            lateral_velocity = float(state.get("local_velocity_y", 0.0))
+            target_steer_abs = (
+                self.reference_steer_gain * heading_error
+                - self.reference_steer_yaw_rate_gain * yaw_rate
+                - self.reference_steer_lateral_gain * lateral_velocity
+            )
+            target_steer_abs = float(np.clip(target_steer_abs, -self.norm_steer_at_max, self.norm_steer_at_max))
+            current_abs_steer = float(self.current_actions[0]) if hasattr(self, "current_actions") else 0.0
+            max_steer_delta = max(float(self.adjusted_controls_rate_limit[0, 1]), 1e-6)
+            desired_steer_delta = np.clip((target_steer_abs - current_abs_steer) / max_steer_delta, -1.0, 1.0)
+            steer_blend = np.clip(
+                self.reference_steer_blend
+                * max(curvature_ratio, min(1.0, speed / max(self.reference_steer_speed_min, 1e-6))),
+                0.0,
+                1.0,
+            )
+            biased[0] = (1.0 - steer_blend) * biased[0] + steer_blend * desired_steer_delta
+
+        if self.use_turn_speed_control_bias:
+            current_abs_acc = float(self.current_actions[1]) if hasattr(self, "current_actions") else -1.0
+            current_abs_brake = float(self.current_actions[2]) if hasattr(self, "current_actions") else -1.0
+            turn_risk = max(curvature_ratio, overspeed_ratio, min(1.0, speed_ratio - 0.9))
+            throttle_press_cap = np.clip(1.0 - self.turn_throttle_cap_gain * turn_risk, 0.0, 1.0)
+            throttle_abs_cap = -1.0 + 2.0 * throttle_press_cap
+            max_acc_delta = max(float(self.adjusted_controls_rate_limit[1, 1]), 1e-6)
+            desired_acc_delta_cap = np.clip((throttle_abs_cap - current_abs_acc) / max_acc_delta, -1.0, 1.0)
+            biased[1] = min(biased[1], desired_acc_delta_cap)
+
+            brake_press_floor = np.clip(self.turn_brake_floor_gain * turn_risk, 0.0, 1.0)
+            brake_abs_floor = -1.0 + 2.0 * brake_press_floor
+            max_brake_delta = max(float(self.adjusted_controls_rate_limit[2, 1]), 1e-6)
+            desired_brake_delta_floor = np.clip((brake_abs_floor - current_abs_brake) / max_brake_delta, -1.0, 1.0)
+            biased[2] = max(biased[2], desired_brake_delta_floor)
 
         # Avoid riding the brake while the prior is trying to open the throttle.
         if biased[1] > 0.15:
             biased[2] = min(biased[2], -0.3)
+
+        if overspeed_ratio > 0.0:
+            state["prior_target_speed"] = target_speed
+            state["prior_overspeed_ratio"] = overspeed_ratio
 
         return np.clip(biased, self.action_space.low, self.action_space.high).astype(np.float32)
 
@@ -557,6 +684,15 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         # closest point in the racing line
         state['rl_point'] = rl_point.item()
         state['gap'] = gap[0]
+        (
+            state["curvature_lookahead"],
+            state["curvature_ahead_peak"],
+            state["curvature_ahead_ratio"],
+            state["heuristic_target_speed"],
+            state["overspeed_error"],
+        ) = self.get_corner_guidance(state["LapDist"], speed=state.get("speed"))
+        state["reference_yaw"] = self.get_reference_yaw(state["LapDist"])
+        state["heading_error"] = wrap_to_pi(state["reference_yaw"] - state["yaw"])
 
         if self.enable_out_of_track_calculation:
             state['out_of_track_calc'] = 0.0 if self.track.track_occupancy_grid.is_inside_grid(point).item() > 0. else 1.0
@@ -660,13 +796,32 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
 
     def get_reward(self, state, actions_diff):
         speed = 3.6 * np.array(state['speed'])
-        out_of_track = state["out_of_track_calc"]
-        dist_to_border = state["dist_to_border"]
 
         r = speed
         if self.use_reference_line_in_reward:
             r *= ( 1.0 - (np.abs( state["gap"]) / 12.00))
         r /= 300. # normalize
+
+        if self.use_heuristic_speed_reward and self.overspeed_penalty_coef > 0.0:
+            overspeed_error = np.array(state.get("overspeed_error", 0.0), dtype=np.float32)
+            overspeed_term = np.power(
+                np.maximum(overspeed_error / max(self.heuristic_target_speed_max, 1.0), 0.0),
+                self.overspeed_penalty_power,
+            )
+            r -= self.overspeed_penalty_coef * (
+                overspeed_term * (1.0 + state.get("curvature_ahead_ratio", 0.0))
+            )
+
+        if self.turn_gap_penalty_coef > 0.0:
+            r -= self.turn_gap_penalty_coef * np.abs(state["gap"]) * state.get("curvature_ahead_ratio", 0.0) / 12.0
+
+        if self.heading_error_penalty_coef > 0.0:
+            r -= self.heading_error_penalty_coef * np.abs(state.get("heading_error", 0.0)) / np.pi
+
+        if self.steer_change_penalty_coef > 0.0 and len(actions_diff):
+            r -= self.steer_change_penalty_coef * np.abs(actions_diff[0]) * (
+                1.0 + state.get("curvature_ahead_ratio", 0.0)
+            )
 
         if self.penalize_actions_diff:
             action_difference_penalty = np.linalg.norm(actions_diff, ord=2)
@@ -690,6 +845,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
         logger.info("Reset landed in neutral. Applying sustained throttle until the auto-shifter engages first gear.")
         deadline = time.perf_counter() + launch_timeout_seconds
         attempt = 0
+        controls_reinitialized = False
         while time.perf_counter() < deadline:
             attempt += 1
             self.client.controls.set_controls(steer=0.0, acc=1.0, brake=-1.0)
@@ -697,6 +853,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             state = self.client.step_sim()
             gear = state.get("actualGear", 2)
             speed = state.get("speed", 0.0)
+            acc_status = state.get("accStatus", 0.0)
 
             if attempt == 1 or attempt % 10 == 0 or gear > 1:
                 logger.info(
@@ -704,10 +861,19 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
                     attempt,
                     gear,
                     speed,
-                    state.get("accStatus", 0.0),
+                    acc_status,
                     state.get("actualClutch", state.get("clutch", 0.0)),
                     state.get("RPM", 0.0),
                 )
+
+            if (not controls_reinitialized) and attempt >= 5 and acc_status <= 0.05 and speed <= 0.05:
+                logger.warning(
+                    "Launch assist is commanding throttle but accStatus remains %.3f. Reinitializing local controls.",
+                    acc_status,
+                )
+                self.client.reinitialize_local_controls()
+                controls_reinitialized = True
+                continue
 
             if gear > 1 and speed > 0.5:
                 self.client.controls.set_defaults()
@@ -742,6 +908,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             return
 
         self.client.reset(False)
+        self.client.reinitialize_local_controls()
 
     def reset(self, seed=None, verbose=False):
         self.end_of_episode_stats()
@@ -838,9 +1005,11 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             obs = np.hstack([obs, 0.0])
 
         # add curvature look ahead
-        LAC = self.ref_lap.get_curvature_segment(state['LapDist'],
-                                                    CURV_LOOK_AHEAD_DISTANCE,       # meters ahead
-                                                    CURV_LOOK_AHEAD_VECTOR_SIZE)    # size of the vector downsampled
+        LAC = state.get("curvature_lookahead")
+        if LAC is None:
+            LAC = self.ref_lap.get_curvature_segment(state['LapDist'],
+                                                        CURV_LOOK_AHEAD_DISTANCE,       # meters ahead
+                                                        CURV_LOOK_AHEAD_VECTOR_SIZE)    # size of the vector downsampled
         obs = np.hstack([obs, LAC / CURV_NORMALIZATION_CONSTANT])
 
 
@@ -939,6 +1108,7 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             differences = np.diff(ep.steps.values)
             number_packages_lost = np.sum(differences[differences > 1])
             gap_abs_max = np.abs(ep.gap).max()
+            gap_abs_mean = np.abs(ep.gap).mean()
             r = { "ep_count": self.n_episodes,
                   "ep_steps":len(ep),
                   "total_steps": self.total_steps,
@@ -946,10 +1116,26 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
                   "ep_reward": ep.reward.sum(),
                   "speed_mean": ep.speed.mean(),
                   "speed_max": ep.speed.max(),
+                  "gap_abs_mean": gap_abs_mean,
+                  "gap_abs_max": gap_abs_max,
+                  "throttle_mean": ep.accStatus.mean(),
+                  "brake_mean": ep.brakeStatus.mean(),
+                  "steer_abs_mean": np.abs(ep.steerAngle / self.obs_channels_info['steerAngle']).mean(),
                   #"completedLaps": ep.completedLaps.values[-1],
                   "BestLap": ep['BestLap'].values[-1] / 1000.,
                   "terminated": ep.terminated.values[-1]
             }
+            if "heuristic_target_speed" in ep.columns:
+                r["target_speed_mean"] = ep.heuristic_target_speed.mean()
+                r["target_speed_min"] = ep.heuristic_target_speed.min()
+            if "overspeed_error" in ep.columns:
+                r["overspeed_mean"] = ep.overspeed_error.mean()
+                r["overspeed_max"] = ep.overspeed_error.max()
+            if "out_of_track" in ep.columns:
+                r["out_of_track_frac"] = ep.out_of_track.mean()
+            if "heading_error" in ep.columns:
+                r["heading_error_mean"] = np.abs(ep.heading_error).mean()
+                r["heading_error_max"] = np.abs(ep.heading_error).max()
             for i, lapCount in enumerate(list(set( ep.LapCount ))):
                 r[f"LapNo_{i}"] = ep[ep.LapCount == lapCount]["iLastTime"].values[-1] / 1000 # to seconds
             #  BestLap from the dictionary, excluding lap times that are 0 (incomplete laps)
@@ -960,7 +1146,20 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
                 for i, lapCount in enumerate(list(set( ep.LapCount ))):
                     logger.info(f"LapNo_{i}: {r[f'LapNo_{i}']:6.2f}")
                 logger.info(f"ep_bestLapTime: {r['ep_bestLapTime']:6.2f}")
-                logger.info(f"speed_mean: {r['speed_mean']:6.2f} speed_max: {r['speed_max']:6.2f} max_abs_gap: {gap_abs_max:6.2f} ep_laps: {len(set(ep.LapCount))}")
+                logger.info(
+                    f"speed_mean: {r['speed_mean']:6.2f} speed_max: {r['speed_max']:6.2f} "
+                    f"mean_abs_gap: {gap_abs_mean:6.2f} max_abs_gap: {gap_abs_max:6.2f} ep_laps: {len(set(ep.LapCount))}"
+                )
+                if "overspeed_mean" in r:
+                    logger.info(
+                        f"target_speed_mean: {r['target_speed_mean']:6.2f} "
+                        f"overspeed_mean: {r['overspeed_mean']:6.2f} overspeed_max: {r['overspeed_max']:6.2f}"
+                    )
+                if "heading_error_mean" in r:
+                    logger.info(
+                        f"heading_error_mean: {r['heading_error_mean']:6.3f} "
+                        f"heading_error_max: {r['heading_error_max']:6.3f}"
+                    )
                 if len(ep) > 10:
                     dt = np.diff( ep.currentTime.values )[1:]
                     logger.info(f"dt avr: {dt.mean():.3f} std: {dt.std():.3f} min: {dt.min():.3f} max: {dt.max():.3f}")

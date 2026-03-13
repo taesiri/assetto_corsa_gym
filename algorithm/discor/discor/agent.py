@@ -262,6 +262,8 @@ class Agent:
 
                 while (not done):
                     action, entropies = self._algo.exploit(state)
+                    if hasattr(self._test_env, "bias_action"):
+                        action = self._test_env.bias_action(action)
                     next_state, reward, done, info = self._test_env.step(action)
                     self._test_env.states[-1]["entropies"] = entropies.cpu().numpy().item()
                     episode_return += reward

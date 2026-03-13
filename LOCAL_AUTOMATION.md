@@ -1,6 +1,12 @@
 # Local Automation Notes
 
-This checkout has local scripts and code changes for running AssettoCorsaGym unattended on Windows against the stock Assetto Corsa launcher.
+This file documents the local changes inside the nested gym checkout.
+
+The canonical end-to-end Windows setup guide now lives at:
+
+- [../docs/SETUP_AND_TRAINING.md](../docs/SETUP_AND_TRAINING.md)
+
+This file focuses on what was added or changed locally in this checkout.
 
 ## Added Scripts
 
@@ -37,10 +43,14 @@ That script:
 - forces `monza` + `ks_mazda_miata` Hotlap,
 - enables `sensors_par`,
 - copies the `Vjoy.ini` preset into the active `controls.ini`,
-- launches AC through Steam,
+- rewrites `PGUID0` to the currently enumerated live `vJoy Device` GUID,
+- forces the RDP-safe `1024x768` windowed render mode,
+- launches AC through the stock launcher,
 - dismisses the setup wizard if needed,
 - clicks through the stock launcher,
 - enters cockpit view,
+- clicks the in-session steering wheel icon so the car accepts drive input,
+- clicks back into the windshield area so the live session keeps focus.
 - can optionally skip the watcher with `-SkipWatcher`.
 
 The root wrapper scripts provide the normal operator entrypoints:
@@ -50,6 +60,8 @@ The root wrapper scripts provide the normal operator entrypoints:
 - [Train-LiveAgent.ps1](C:/Workspace/RacingSim/scripts/Train-LiveAgent.ps1)
 - [Resume-LiveAgent.ps1](C:/Workspace/RacingSim/scripts/Resume-LiveAgent.ps1)
 - [Plot-Run.ps1](C:/Workspace/RacingSim/scripts/Plot-Run.ps1)
+- [Launch-TurningTrain.ps1](C:/Workspace/RacingSim/scripts/Launch-TurningTrain.ps1)
+- [Run-ExperimentSweep.ps1](C:/Workspace/RacingSim/scripts/experimental/Run-ExperimentSweep.ps1)
 
 ## Typical Flow
 
@@ -108,6 +120,12 @@ or:
 powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Resume-LiveAgent.ps1 -Algo sac -DurationHours 3
 ```
 
+Current turning-focused continuation launcher:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Launch-TurningTrain.ps1
+```
+
 ## Verified Run Outputs
 
 - Short online sanity run:
@@ -122,3 +140,4 @@ powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Resume-L
 - The setup is operational, but training is still noisy and can produce short bad episodes or physics outliers.
 - The live launcher automation is pixel-position based against the stock Assetto Corsa launcher on this machine, not a general menu automation framework.
 - `plot_live_run.py` works, but TensorBoard emits a harmless Windows path warning while loading the scalar file.
+- The most common setup failure mode was not the policy itself but the AC session overlay keeping the car in a non-driveable state; the outer launcher now handles that explicit handoff step.

@@ -47,7 +47,7 @@ def main():
     config = OmegaConf.merge(config, cli_conf)
 
     if config.work_dir is not None:
-        work_dir = os.path.abspath(args.work_dir) + os.sep + config.track + os.sep + config.car + os.sep
+        work_dir = os.path.abspath(config.work_dir)
         os.makedirs(work_dir, exist_ok=True)
     else:
         work_dir = "outputs" + os.sep + datetime.now().strftime('%Y%m%d_%H%M%S.%f')[:-3]

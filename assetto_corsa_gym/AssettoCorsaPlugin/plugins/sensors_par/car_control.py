@@ -40,6 +40,14 @@ class Controls(object):
 
         self.ct_12_stop = False
 
+    def reopen(self):
+        try:
+            self.vj.close()
+        except Exception:
+            logger.debug("vJoy close during reopen failed", exc_info=True)
+        self.vj = vJoy()
+        return self.vj.open()
+
     def close(self):
         self.vj.close()
 
@@ -86,10 +94,10 @@ class Controls(object):
                     self.onButtons = 0
             else:
                 self.onButtons = 0
-        self.update()
+        return self.update()
 
     def update(self):
-        self.setJoy(self.steer, self.acc, self.brake, self.onButtons, SCALE)
+        return self.setJoy(self.steer, self.acc, self.brake, self.onButtons, SCALE)
 
     def setJoy(self, valueX, valueY, valueZ, onButtons, scale):
         """
@@ -101,5 +109,17 @@ class Controls(object):
         yPos = int(valueY * 2 * scale)
         zPos = int(valueZ * 2 * scale)
 
-        joystickPosition = self.vj.generateJoystickPosition(wAxisX= xPos, wAxisY=yPos, wAxisZ=zPos, lButtons=onButtons)
-        self.vj.update(joystickPosition)
+        joystickPosition = self.vj.generateJoystickPosition(wAxisX=xPos, wAxisY=yPos, wAxisZ=zPos, lButtons=onButtons)
+        if self.vj.update(joystickPosition):
+            return True
+
+        logger.warning("vJoy update failed in Controls.setJoy(). Reopening local controls and retrying.")
+        if self.reopen():
+            joystickPosition = self.vj.generateJoystickPosition(
+                wAxisX=xPos, wAxisY=yPos, wAxisZ=zPos, lButtons=onButtons
+            )
+            if self.vj.update(joystickPosition):
+                return True
+
+        logger.error("Unable to send controls through vJoy after reopen attempt.")
+        return False
