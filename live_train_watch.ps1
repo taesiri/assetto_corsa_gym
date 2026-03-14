@@ -1,7 +1,6 @@
 $ErrorActionPreference = "Stop"
 
 $repoRoot = "C:\Workspace\RacingSim\assetto_corsa_gym"
-$pythonExe = "C:\Workspace\RacingSim\.venv-acgym\Scripts\python.exe"
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $watchDir = Join-Path $repoRoot ("outputs\live_watch_" + $timestamp)
 $smokeLog = Join-Path $watchDir "smoke.log"
@@ -10,6 +9,14 @@ $statusFile = Join-Path $watchDir "status.txt"
 
 New-Item -ItemType Directory -Force -Path $watchDir | Out-Null
 Push-Location $repoRoot
+
+function Get-UvExe {
+    $uvCmd = Get-Command uv -ErrorAction SilentlyContinue
+    if (-not $uvCmd) {
+        throw "uv was not found on PATH. Install uv and run 'uv sync' before using this watcher."
+    }
+    return $uvCmd.Source
+}
 
 function Write-Status([string]$message) {
     $line = ("[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $message)
@@ -38,8 +45,10 @@ while (-not (Test-TcpPort -HostName "127.0.0.1" -Port 2347)) {
     Start-Sleep -Seconds 2
 }
 
+$uvExe = Get-UvExe
+
 Write-Status "Plugin detected. Running smoke_random.py."
-& $pythonExe -u "C:\Workspace\RacingSim\assetto_corsa_gym\smoke_random.py" *>&1 | Tee-Object -FilePath $smokeLog
+& $uvExe run --no-sync python -u "C:\Workspace\RacingSim\assetto_corsa_gym\smoke_random.py" *>&1 | Tee-Object -FilePath $smokeLog
 if ($LASTEXITCODE -ne 0) {
     Write-Status "Smoke test failed with exit code $LASTEXITCODE."
     Pop-Location
@@ -47,7 +56,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Status "Smoke test passed. Starting live SAC training."
-& $pythonExe -u "C:\Workspace\RacingSim\assetto_corsa_gym\train.py" `
+& $uvExe run --no-sync python -u "C:\Workspace\RacingSim\assetto_corsa_gym\train.py" `
     "disable_wandb=True" `
     "Agent.num_steps=20000" `
     "Agent.memory_size=50000" `

@@ -4,6 +4,9 @@ data/data_sets
 archive
 *.ptorch
 *.pkl?
+.venv/
+qwen_runtime/.venv/
+qwen_runtime/__pycache__/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

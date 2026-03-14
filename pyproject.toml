@@ -1,0 +1,82 @@
+[project]
+name = "assetto-corsa-gym-runtime"
+version = "0.1.0"
+description = "Runtime and tooling for Assetto Corsa shared-backbone RL experiments."
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "cloudpickle==2.2.0",
+    "cycler==0.11.0",
+    "fonttools==4.37.1",
+    "gym",
+    "huggingface-hub",
+    "intersect",
+    "jupyter",
+    "kiwisolver==1.4.4",
+    "matplotlib==3.5.3",
+    "mpld3",
+    "numba",
+    "numpy==1.23.3",
+    "omegaconf",
+    "packaging==21.3",
+    "pandas==1.4.4",
+    "pillow==9.2.0",
+    "pyarrow",
+    "pybullet",
+    "pygame",
+    "pyglet",
+    "pyparsing==3.0.9",
+    "python-box",
+    "python-dateutil==2.8.2",
+    "pytz==2022.2.1",
+    "scikit-optimize",
+    "six==1.16.0",
+    "tensorboard",
+    "termcolor",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "torchvision==0.23.0",
+    "tqdm",
+    "typing_extensions>=4.12.2",
+    "wandb",
+]
+
+[project.optional-dependencies]
+planner = [
+    "accelerate",
+    "peft",
+    "safetensors",
+    "sentencepiece",
+    "transformers @ git+https://github.com/huggingface/transformers.git@main",
+]
+coach = [
+    "fastapi",
+    "pydantic>=2.10.0",
+    "uvicorn",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+gym = { path = "vendor/gym-0.21.0-py3-none-any.whl" }
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchaudio = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

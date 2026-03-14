@@ -14,13 +14,33 @@ sys.path.extend([os.path.abspath('./assetto_corsa_gym'), './algorithm/discor'])
 # Custom module imports
 import AssettoCorsaEnv.assettoCorsa as assettoCorsa
 import AssettoCorsaEnv.data_loader as data_loader
-from discor.algorithm import SAC, DisCor
+from discor.algorithm import SAC, DisCor, SharedBackboneSAC
 from discor.agent import Agent
 import common.misc as misc
 import common.logging_config as logging_config
 from common.logger import Logger
 
 logger = logging.getLogger(__name__)
+
+
+def select_cuda_device(config):
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for training.")
+
+    runtime_cfg = getattr(config, "Runtime", None)
+    requested_index = int(getattr(runtime_cfg, "cuda_device_index", 0)) if runtime_cfg is not None else 0
+    device_count = torch.cuda.device_count()
+    if requested_index < 0 or requested_index >= device_count:
+        logger.warning(
+            "Requested CUDA device %s is unavailable. Falling back to cuda:0 out of %d visible devices.",
+            requested_index,
+            device_count,
+        )
+        requested_index = 0
+
+    torch.cuda.set_device(requested_index)
+    logger.info("Using CUDA device %d: %s", requested_index, torch.cuda.get_device_name(requested_index))
+    return torch.device(f"cuda:{requested_index}"), requested_index
 
 def parse_args(hardcode=None):
     parser = argparse.ArgumentParser(description="Description of your program.")
@@ -45,14 +65,19 @@ def main():
     # Apply command line overrides
     cli_conf = OmegaConf.from_dotlist(args.overrides)
     config = OmegaConf.merge(config, cli_conf)
+    if "Runtime" not in config:
+        config.Runtime = OmegaConf.create()
+    os.environ["ACGYM_TRAINING_LOW_FI"] = "1" if bool(getattr(config.Runtime, "low_fi_training", False)) else "0"
 
     if config.work_dir is not None:
         work_dir = os.path.abspath(config.work_dir)
         os.makedirs(work_dir, exist_ok=True)
     else:
         work_dir = "outputs" + os.sep + datetime.now().strftime('%Y%m%d_%H%M%S.%f')[:-3]
-        work_dir = os.path.abspath(work_dir) + os.sep
+        work_dir = os.path.abspath(work_dir)
         os.makedirs(work_dir, exist_ok=True)
+    if not work_dir.endswith(os.sep):
+        work_dir = work_dir + os.sep
     config.work_dir = work_dir
 
     logging_config.create_logging(level=logging.DEBUG, file_name=work_dir + "log.log")
@@ -69,8 +94,16 @@ def main():
     env = assettoCorsa.make_ac_env(cfg=config, work_dir=work_dir)
 
     # Device to use
-    device = torch.device("cuda")
-    assert device.type == "cuda", "Only cuda is supported"
+    device, cuda_device_index = select_cuda_device(config)
+    config.Runtime.cuda_device_index = cuda_device_index
+
+    if getattr(config, "UnifiedBackbone", None) is not None:
+        config.UnifiedBackbone.head_device_index = cuda_device_index
+        config.UnifiedBackbone.ctrl_rate_hz = float(getattr(config.AssettoCorsa, "ego_sampling_freq", 25))
+
+    use_shared_backbone = args.algo in ("shared_sac", "shared_backbone_sac") or (
+        args.algo == "sac" and bool(getattr(getattr(config, "UnifiedBackbone", {}), "enabled", False))
+    )
 
     if args.algo == 'discor':
         algo = DisCor(
@@ -78,6 +111,18 @@ def main():
             action_dim=env.action_space.shape[0],
             device=device, seed=config.seed,
             **OmegaConf.to_container(config.SAC), **OmegaConf.to_container(config.DisCor))
+    elif use_shared_backbone:
+        algo = SharedBackboneSAC(
+            state_dim=env.observation_space.shape[0],
+            action_dim=env.action_space.shape[0],
+            device=device,
+            seed=config.seed,
+            unified_backbone_config=OmegaConf.to_container(config.UnifiedBackbone),
+            obs_channel_names=getattr(env, "obs_enabled_channels", None),
+            task_id_dim=getattr(getattr(env, "tasks_ids", None), "num_tasks", 1),
+            control_delta_dim=int(getattr(config.UnifiedBackbone, "control_delta_dim", 128)),
+            **OmegaConf.to_container(config.SAC),
+        )
     elif args.algo == 'sac':
         algo = SAC(
             state_dim=env.observation_space.shape[0],

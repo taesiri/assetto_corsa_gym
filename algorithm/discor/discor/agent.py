@@ -19,7 +19,9 @@ import time
 class Agent:
     def __init__(self, env, test_env, algo, log_dir, device, num_steps=3000000,
                  batch_size=256, memory_size=1_000_000,
-                 update_interval=1, start_steps=10000, log_interval=10, checkpoint_freq=0,
+                 update_interval=1, update_every_steps=None, update_steps_per_call=1,
+                 post_episode_update_budget_s=0.0, target_update_only_on_optimizer_step=True,
+                 start_steps=10000, log_interval=10, checkpoint_freq=0,
                  eval_interval=5000, num_eval_episodes=5, seed=0, use_offline_buffer=False, offline_buffer_size=1_000_000,
                  wandb_logger=None, save_final_buffer=False):
 
@@ -64,11 +66,23 @@ class Agent:
         self._num_steps = num_steps
         self._batch_size = batch_size
         self._update_interval = update_interval
+        self._update_every_steps = max(1, int(update_every_steps if update_every_steps is not None else update_interval))
+        self._update_steps_per_call = max(1, int(update_steps_per_call))
+        self._post_episode_update_budget_s = max(0.0, float(post_episode_update_budget_s))
+        self._target_update_only_on_optimizer_step = bool(target_update_only_on_optimizer_step)
         self._start_steps = start_steps
         self._log_interval = log_interval
         self._eval_interval = eval_interval
         self._num_eval_episodes = num_eval_episodes
         self._start_time = time.time()
+        self._optimizer_updates_total = 0
+        self._optimizer_updates_live_total = 0
+        self._optimizer_updates_post_episode_total = 0
+        self._optimizer_updates_offline_refresh_total = 0
+        self._optimizer_update_time_total_s = 0.0
+        self._reset_time_total_s = 0.0
+        self._episode_wall_time_total_s = 0.0
+        self._episode_live_time_total_s = 0.0
 
         self.best_lap_time = np.inf
         self.best_reward = -np.inf
@@ -76,6 +90,10 @@ class Agent:
         logger.info(f'num_steps: {num_steps}')
         logger.info(f'batch_size: {batch_size}')
         logger.info(f'update_interval: {update_interval}')
+        logger.info(f'update_every_steps: {self._update_every_steps}')
+        logger.info(f'update_steps_per_call: {self._update_steps_per_call}')
+        logger.info(f'post_episode_update_budget_s: {self._post_episode_update_budget_s}')
+        logger.info(f'target_update_only_on_optimizer_step: {self._target_update_only_on_optimizer_step}')
         logger.info(f'start_steps: {start_steps}')
         logger.info(f'log_interval: {log_interval}')
         logger.info(f'eval_interval: {eval_interval}')
@@ -114,16 +132,77 @@ class Agent:
         finally:
             self.save(os.path.join(self._model_dir, 'final'), save_buffer=self.save_final_buffer)
 
-    def update_model(self):
+    def update_model(self, force=False, max_updates=None, source="live"):
+        if len(self._replay_buffer) < self._batch_size:
+            if not self._target_update_only_on_optimizer_step:
+                self._algo.update_target_networks()
+            return None
+
+        if (not force) and (self._steps % self._update_every_steps != 0):
+            if not self._target_update_only_on_optimizer_step:
+                self._algo.update_target_networks()
+            return None
+
+        updates_to_run = max(1, int(max_updates if max_updates is not None else self._update_steps_per_call))
         train_stats = None
-        # Update online networks.
-        if self._steps % self._update_interval == 0:
+        optimizer_updates = 0
+
+        for _ in range(updates_to_run):
             batch = self._replay_buffer.sample(self._batch_size, self._device)
             train_stats = self._algo.update_online_networks(batch, self._writer)
+            optimizer_updates += 1
+            self._optimizer_updates_total += 1
+            if source == "post_episode":
+                self._optimizer_updates_post_episode_total += 1
+            elif source == "offline_refresh":
+                self._optimizer_updates_offline_refresh_total += 1
+            else:
+                self._optimizer_updates_live_total += 1
+            if self._target_update_only_on_optimizer_step:
+                self._algo.update_target_networks()
 
-        # Update target networks.
-        self._algo.update_target_networks()
+        if optimizer_updates and (not self._target_update_only_on_optimizer_step):
+            self._algo.update_target_networks()
+
+        if train_stats is None:
+            return {"optimizer_updates": optimizer_updates}
+
+        train_stats = dict(train_stats)
+        train_stats["optimizer_updates"] = optimizer_updates
         return train_stats
+
+    def run_replay_update_burst(self, max_seconds, max_updates=256, source="post_episode"):
+        if max_seconds <= 0 or len(self._replay_buffer) < self._batch_size:
+            return {"updates": 0, "elapsed_s": 0.0}
+
+        deadline = time.perf_counter() + max_seconds
+        updates = 0
+        elapsed = 0.0
+        last_stats = None
+
+        while updates < max_updates and time.perf_counter() < deadline:
+            update_start = time.perf_counter()
+            stats = self.update_model(force=True, max_updates=1, source=source)
+            update_elapsed = time.perf_counter() - update_start
+            if not stats:
+                break
+
+            update_count = int(stats.get("optimizer_updates", 0))
+            if update_count <= 0:
+                break
+
+            updates += update_count
+            elapsed += update_elapsed
+            last_stats = stats
+
+        self._optimizer_update_time_total_s += elapsed
+        payload = {
+            "updates": updates,
+            "elapsed_s": elapsed,
+        }
+        if last_stats:
+            payload["last_train_stats"] = last_stats
+        return payload
 
     def train_episode(self):
         """
@@ -136,11 +215,21 @@ class Agent:
         ep_start_time = time.time()
         ep_stats = {}
         train_stats = None
+        reset_time_s = 0.0
+        optimizer_updates_episode = 0
+        live_update_time_s = 0.0
 
         try:
             done = False
             step_perf, action_perf, update_model_perf = [], [], []
+            reset_start_time = time.perf_counter()
             state = self._env.reset()
+            if hasattr(self._algo, "reset_runtime_context"):
+                self._algo.reset_runtime_context(state, env_info=getattr(self._env, "info", None))
+            if hasattr(self._algo, "get_latest_control_context") and hasattr(self._env, "set_unified_plan_control"):
+                self._env.set_unified_plan_control(self._algo.get_latest_control_context())
+            reset_time_s = time.perf_counter() - reset_start_time
+            self._reset_time_total_s += reset_time_s
             step_start_time = time.perf_counter()
 
             while (not done):
@@ -152,6 +241,8 @@ class Agent:
                         action = self._env.action_space.sample()
                 else:
                     action, _ = self._algo.explore(state)
+                if hasattr(self._algo, "get_latest_control_context") and hasattr(self._env, "set_unified_plan_control"):
+                    self._env.set_unified_plan_control(self._algo.get_latest_control_context())
                 if hasattr(self._env, "bias_action"):
                     action = self._env.bias_action(action)
                 action_perf.append(time.perf_counter() - start_profile)
@@ -162,11 +253,20 @@ class Agent:
                 # update model
                 start_profile = time.perf_counter()
                 if self._steps >= self._start_steps:
-                    train_stats = self.update_model()
-                update_model_perf.append(time.perf_counter() - start_profile)
+                    update_stats = self.update_model(source="live")
+                    if update_stats:
+                        train_stats = update_stats
+                        optimizer_updates_episode += int(update_stats.get("optimizer_updates", 0))
+                update_elapsed = time.perf_counter() - start_profile
+                update_model_perf.append(update_elapsed)
+                live_update_time_s += update_elapsed
 
                 # get observations
                 next_state, reward, done, info = self._env.step(action=None)  # action is already applied
+                if hasattr(self._algo, "observe_env_info"):
+                    self._algo.observe_env_info(info, next_state=next_state, reward=reward, done=done)
+                if hasattr(self._algo, "get_latest_control_context") and hasattr(self._env, "set_unified_plan_control"):
+                    self._env.set_unified_plan_control(self._algo.get_latest_control_context())
                 step_perf.append(time.perf_counter() - step_start_time)
                 step_start_time = time.perf_counter()
 
@@ -199,6 +299,23 @@ class Agent:
         finally:
             env_ep_stats = self._env.close()
 
+        env_ep_stats = env_ep_stats if isinstance(env_ep_stats, dict) else {}
+        live_ep_time = time.time() - ep_start_time
+        self._optimizer_update_time_total_s += live_update_time_s
+
+        post_episode_update = self.run_replay_update_burst(
+            max_seconds=self._post_episode_update_budget_s,
+            max_updates=256,
+            source="post_episode",
+        )
+        optimizer_updates_episode += int(post_episode_update.get("updates", 0))
+        post_episode_update_time_s = float(post_episode_update.get("elapsed_s", 0.0))
+        if post_episode_update.get("last_train_stats"):
+            train_stats = post_episode_update["last_train_stats"]
+        episode_wall_time_s = live_ep_time + post_episode_update_time_s
+        self._episode_live_time_total_s += live_ep_time
+        self._episode_wall_time_total_s += episode_wall_time_s
+
         # We log running mean of training rewards.
         self._train_return.append(episode_return)
 
@@ -210,27 +327,35 @@ class Agent:
               f'Episode steps: {episode_steps:<4}  '
               f'Return: {episode_return:<5.1f}')
 
-        ep_time = time.time() - ep_start_time
         ep_stats['total_steps'] = self._steps
         ep_stats['episode'] = self._episodes
         ep_stats['ep_reward'] = episode_return
         ep_stats['ep_steps'] = episode_steps
-        ep_stats.update(env_ep_stats if isinstance(env_ep_stats, dict) else {})
+        ep_stats['reset_time_s'] = reset_time_s
+        ep_stats['episode_live_time_s'] = live_ep_time
+        ep_stats['episode_wall_time_s'] = episode_wall_time_s
+        ep_stats['optimizer_updates'] = optimizer_updates_episode
+        ep_stats['post_episode_optimizer_updates'] = int(post_episode_update.get("updates", 0))
+        ep_stats['post_episode_update_time_s'] = post_episode_update_time_s
+        ep_stats.update(env_ep_stats)
 
-        if env_ep_stats["BestLap"] < self.best_lap_time:
+        if env_ep_stats.get("BestLap", 0) > 0 and env_ep_stats["BestLap"] < self.best_lap_time:
             logger.info(f"new best lap time {env_ep_stats['BestLap']}")
             self.best_lap_time = env_ep_stats["BestLap"]
             self.save(os.path.join(self._model_dir, 'best_lap_time'), save_buffer=False)
 
-        if env_ep_stats["ep_reward"] > self.best_reward:
-            logger.info(f"new best reward {env_ep_stats['ep_reward']}")
-            self.best_reward = env_ep_stats["ep_reward"]
+        best_reward_value = env_ep_stats.get("ep_reward", episode_return)
+        if best_reward_value > self.best_reward:
+            logger.info(f"new best reward {best_reward_value}")
+            self.best_reward = best_reward_value
             self.save(os.path.join(self._model_dir, 'best_reward'), save_buffer=False)
 
         eval_metrics = self.common_metrics()
         eval_metrics.update(ep_stats)
         if train_stats:
-            eval_metrics.update(train_stats)
+            last_train_stats = dict(train_stats)
+            last_train_stats.pop("optimizer_updates", None)
+            eval_metrics.update(last_train_stats)
         eval_metrics["update_model_perf_mean"] = np.array(update_model_perf).mean()
         eval_metrics["update_model_perf_max"] = np.array(update_model_perf).max()
         eval_metrics["update_model_perf_std"] = np.array(update_model_perf).std()
@@ -242,29 +367,56 @@ class Agent:
         eval_metrics["action_perf_mean"] = np.array(action_perf).mean()
         eval_metrics["action_perf_max"] = np.array(action_perf).max()
         eval_metrics["action_perf_std"] = np.array(action_perf).std()
+        eval_metrics["env_steps_per_sec"] = episode_steps / max(live_ep_time, 1e-6)
+        eval_metrics["gradient_updates_per_sec"] = optimizer_updates_episode / max(episode_wall_time_s, 1e-6)
+        if hasattr(self._algo, "get_runtime_metrics"):
+            eval_metrics.update(self._algo.get_runtime_metrics())
         logger.info(f"Avr step time: {eval_metrics['step_perf_mean']:.3f}s, actions: {eval_metrics['action_perf_mean']:.4f}s, update: {eval_metrics['update_model_perf_mean']:.3f}s")
         logger.info(f"Max step time: {eval_metrics['step_perf_max']:.3f}s, actions: {eval_metrics['action_perf_max']:.4f}s, update: {eval_metrics['update_model_perf_max']:.3f}s")
         logger.info(f"std step time: {eval_metrics['step_perf_std']:.3f}s, actions: {eval_metrics['action_perf_std']:.4f}s, update: {eval_metrics['update_model_perf_std']:.3f}s")
         logger.info(f"step_perf_> thres: {eval_metrics['step_perf_> thres']} / {len(step_perf)}")
+        logger.info(
+            "Episode throughput. reset: %.3fs live: %.2fs wall: %.2fs env_steps/s: %.2f gradient_updates/s: %.2f",
+            reset_time_s,
+            live_ep_time,
+            episode_wall_time_s,
+            eval_metrics["env_steps_per_sec"],
+            eval_metrics["gradient_updates_per_sec"],
+        )
         if self.wandb_logger:
             self.wandb_logger.log(eval_metrics, 'episodes')
         self.episodes_stats.append(eval_metrics)
         pd.DataFrame(self.episodes_stats).to_csv(os.path.join(self._log_dir, 'summary.csv'), index=None)
-        logger.info(f'Episode done. Took {ep_time:.2f}s.  Steps per episode: {episode_steps}. Buffer size: {len(self._replay_buffer)} fps: {episode_steps/ep_time:.2f}')
+        logger.info(
+            "Episode done. Took %.2fs wall-clock. Live segment %.2fs. Steps per episode: %d. Buffer size: %d fps: %.2f",
+            episode_wall_time_s,
+            live_ep_time,
+            episode_steps,
+            len(self._replay_buffer),
+            episode_steps / max(live_ep_time, 1e-6),
+        )
 
     def evaluate(self):
         try:
             total_return = 0.0
             for _ in range(self._num_eval_episodes):
                 state = self._test_env.reset()
+                if hasattr(self._algo, "reset_runtime_context"):
+                    self._algo.reset_runtime_context(state, env_info=getattr(self._test_env, "info", None))
+                if hasattr(self._algo, "get_latest_control_context") and hasattr(self._test_env, "set_unified_plan_control"):
+                    self._test_env.set_unified_plan_control(self._algo.get_latest_control_context())
                 episode_return = 0.0
                 done = False
 
                 while (not done):
                     action, entropies = self._algo.exploit(state)
+                    if hasattr(self._algo, "get_latest_control_context") and hasattr(self._test_env, "set_unified_plan_control"):
+                        self._test_env.set_unified_plan_control(self._algo.get_latest_control_context())
                     if hasattr(self._test_env, "bias_action"):
                         action = self._test_env.bias_action(action)
                     next_state, reward, done, info = self._test_env.step(action)
+                    if hasattr(self._algo, "observe_env_info"):
+                        self._algo.observe_env_info(info, next_state=next_state, reward=reward, done=done)
                     self._test_env.states[-1]["entropies"] = entropies.cpu().numpy().item()
                     episode_return += reward
                     state = next_state
@@ -289,6 +441,12 @@ class Agent:
             episode=self._episodes,
             buffer_size=len(self._replay_buffer),
             total_time=time.time() - self._start_time,
+            optimizer_updates_total=self._optimizer_updates_total,
+            optimizer_updates_live_total=self._optimizer_updates_live_total,
+            optimizer_updates_post_episode_total=self._optimizer_updates_post_episode_total,
+            optimizer_updates_offline_refresh_total=self._optimizer_updates_offline_refresh_total,
+            optimizer_update_time_total_s=self._optimizer_update_time_total_s,
+            reset_time_total_s=self._reset_time_total_s,
         )
 
     def load_pre_train_data(self, trajs_path, env):
@@ -324,5 +482,5 @@ class Agent:
         self._algo.update_entropy = False
         logger.info("Pre-training...")
         for _ in tqdm(range(self._replay_buffer._n)):
-            self.update_model()
+            self.update_model(force=True, max_updates=1, source="offline_refresh")
         self._algo.update_entropy = True

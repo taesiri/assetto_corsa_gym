@@ -16,7 +16,7 @@ def parse_args():
         help="Run directory that contains episodes_stats.csv and laps/.",
     )
     parser.add_argument("--per-run-limit", type=int, default=8, help="Max episodes kept per run.")
-    parser.add_argument("--total-limit", type=int, default=24, help="Max total episodes kept.")
+    parser.add_argument("--total-limit", type=int, default=32, help="Max total episodes kept.")
     parser.add_argument("--min-reward", type=float, default=80.0)
     parser.add_argument("--min-speed", type=float, default=18.0)
     parser.add_argument("--max-gap", type=float, default=1.4)

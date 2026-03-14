@@ -1,0 +1,35 @@
+[project]
+name = "ac-qwen-runtime"
+version = "0.1.0"
+description = "Dedicated Qwen 3.5 runtime for Assetto Corsa shared-backbone experiments."
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "accelerate",
+    "fastapi",
+    "huggingface-hub",
+    "peft",
+    "safetensors",
+    "sentencepiece",
+    "torch==2.8.0",
+    "transformers @ git+https://github.com/huggingface/transformers.git@main",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+qlora = [
+    "bitsandbytes",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
