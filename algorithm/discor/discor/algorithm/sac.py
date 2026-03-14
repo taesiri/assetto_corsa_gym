@@ -91,7 +91,7 @@ class SAC(Algorithm):
         return stats
 
     def update_policy_and_entropy(self, batch, writer):
-        states, actions, rewards, next_states, dones = batch
+        states, actions, rewards, next_states, dones = batch[:5]
 
         # Update policy.
         policy_loss, entropies = self.calc_policy_loss(states)
@@ -147,7 +147,7 @@ class SAC(Algorithm):
         return entropy_loss
 
     def update_q_functions(self, batch, writer, imp_ws1=None, imp_ws2=None):
-        states, actions, rewards, next_states, dones = batch
+        states, actions, rewards, next_states, dones = batch[:5]
 
         # Calculate current and target Q values.
         curr_qs1, curr_qs2 = self.calc_current_qs(states, actions)

@@ -15,18 +15,20 @@ class NStepBuffer:
         self._nstep = nstep
         self.reset()
 
-    def append(self, state, action, reward):
+    def append(self, state, action, reward, prev_state=None):
         self._states.append(state)
         self._actions.append(action)
         self._rewards.append(reward)
+        self._prev_states.append(prev_state)
 
     def get(self):
         assert len(self._rewards) > 0
 
         state = self._states.popleft()
         action = self._actions.popleft()
+        prev_state = self._prev_states.popleft()
         reward = self._nstep_reward()
-        return state, action, reward
+        return state, action, reward, prev_state
 
     def _nstep_reward(self):
         reward = np.sum([
@@ -38,6 +40,7 @@ class NStepBuffer:
         self._states = deque(maxlen=self._nstep)
         self._actions = deque(maxlen=self._nstep)
         self._rewards = deque(maxlen=self._nstep)
+        self._prev_states = deque(maxlen=self._nstep)
 
     def is_empty(self):
         return len(self._rewards) == 0
@@ -72,41 +75,53 @@ class ReplayBuffer:
             (self._memory_size, ) + self._state_shape, dtype=np.float32)
         self._next_states = np.empty(
             (self._memory_size, ) + self._state_shape, dtype=np.float32)
+        self._prev_states = np.empty(
+            (self._memory_size, ) + self._state_shape, dtype=np.float32)
         self._actions = np.empty(
             (self._memory_size, ) + self._action_shape, dtype=np.float32)
 
         self._rewards = np.empty((self._memory_size, 1), dtype=np.float32)
         self._dones = np.empty((self._memory_size, 1), dtype=np.float32)
 
+        # Hindsight plan code labels: one int per plan code field (6 fields)
+        self._hindsight_plan_ids = np.zeros((self._memory_size, 6), dtype=np.int64)
+
         if self._nstep != 1:
             self._nstep_buffer = NStepBuffer(self._gamma, self._nstep)
         logger.info(f"Replay buffer initialized for {self._memory_size} samples")
 
-    def append(self, state, action, reward, next_state, terminated, episode_done=None):
+    def append(self, state, action, reward, next_state, terminated, episode_done=None, prev_state=None):
         """
         done (masked_done): False if the agent reach time horizons. Else = done
         """
+        if prev_state is None:
+            prev_state = state
+
         if self._nstep != 1:
-            self._nstep_buffer.append(state, action, reward)
+            self._nstep_buffer.append(state, action, reward, prev_state=prev_state)
 
             if self._nstep_buffer.is_full():
-                state, action, reward = self._nstep_buffer.get()
-                self._append(state, action, reward, next_state, terminated)
+                state, action, reward, prev_state = self._nstep_buffer.get()
+                self._append(state, action, reward, next_state, terminated, prev_state)
 
             if terminated or episode_done:
                 while not self._nstep_buffer.is_empty():
-                    state, action, reward = self._nstep_buffer.get()
-                    self._append(state, action, reward, next_state, terminated)
+                    state, action, reward, prev_state = self._nstep_buffer.get()
+                    self._append(state, action, reward, next_state, terminated, prev_state)
 
         else:
-            self._append(state, action, reward, next_state, terminated)
+            self._append(state, action, reward, next_state, terminated, prev_state)
 
-    def _append(self, state, action, reward, next_state, done):
+    def _append(self, state, action, reward, next_state, done, prev_state=None):
         self._states[self._p, ...] = state
         self._actions[self._p, ...] = action
         self._rewards[self._p, ...] = reward
         self._next_states[self._p, ...] = next_state
         self._dones[self._p, ...] = done
+        if prev_state is not None:
+            self._prev_states[self._p, ...] = prev_state
+        else:
+            self._prev_states[self._p, ...] = state
 
         self._n = min(self._n + 1, self._memory_size)
         self._p = (self._p + 1) % self._memory_size
@@ -131,8 +146,18 @@ class ReplayBuffer:
             self._dones[idxes], dtype=torch.float, device=device)
         next_states = torch.tensor(
             self._next_states[idxes], dtype=torch.float, device=device)
+        prev_states = torch.tensor(
+            self._prev_states[idxes], dtype=torch.float, device=device)
 
-        return states, actions, rewards, next_states, dones
+        return states, actions, rewards, next_states, dones, prev_states
+
+    def set_hindsight_labels(self, indices: np.ndarray, plan_ids: np.ndarray) -> None:
+        """Set hindsight plan code labels for specific buffer indices."""
+        self._hindsight_plan_ids[indices] = plan_ids
+
+    def get_hindsight_labels(self, indices: np.ndarray) -> np.ndarray:
+        """Get hindsight plan code labels for specific buffer indices."""
+        return self._hindsight_plan_ids[indices]
 
     def __len__(self):
         return self._n
@@ -170,8 +195,8 @@ class EnsembleBuffer(ReplayBuffer):
 
     def sample(self, batch_size, device=torch.device('cpu')):
         """Sample a batch of data from the two buffers."""
-        obs0, action0, reward0, next_states0, dones0 = self._offline.sample(batch_size // 2, device)
-        obs1, action1, reward1, next_states1, dones1 = (super() if self._online else self._offline).sample(batch_size // 2, device)
+        obs0, action0, reward0, next_states0, dones0, prev_states0 = self._offline.sample(batch_size // 2, device)
+        obs1, action1, reward1, next_states1, dones1, prev_states1 = (super() if self._online else self._offline).sample(batch_size // 2, device)
 
         # Concatenate samples from both buffers
         states = torch.cat([obs0, obs1], dim=0)
@@ -179,5 +204,6 @@ class EnsembleBuffer(ReplayBuffer):
         rewards = torch.cat([reward0, reward1], dim=0)
         next_states = torch.cat([next_states0, next_states1], dim=0)
         dones = torch.cat([dones0, dones1], dim=0)
+        prev_states = torch.cat([prev_states0, prev_states1], dim=0)
 
-        return states, actions, rewards, next_states, dones
+        return states, actions, rewards, next_states, dones, prev_states

@@ -60,7 +60,7 @@ class DisCor(SAC):
         self.update_q_functions_and_error_models(batch, writer)
 
     def update_q_functions_and_error_models(self, batch, writer):
-        states, actions, rewards, next_states, dones = batch
+        states, actions, rewards, next_states, dones = batch[:5]
 
         # Calculate importance weights.
         imp_ws1, imp_ws2 = self.calc_importance_weights(next_states, dones)

@@ -4,49 +4,50 @@
 
 This fork adds a shared-backbone `Qwen + SAC` training path on top of the upstream Assetto Corsa Gym codebase.
 
-Current validated state:
+Current validated state (March 14, 2026):
 
-- Python runtime is managed with `uv`
-- main repo runtime is pinned to Python `3.10`
-- real `Qwen3.5` models load in-process
-- the live shared-backbone trainer runs with `Qwen/Qwen3.5-2B-Base`
-- the old internal fallback encoder is no longer required for the normal path
+- Python runtime managed with `uv`, pinned to Python `3.10`
+- Real `Qwen 3.5` models load in-process (2B and 4B verified)
+- Live shared-backbone trainer runs with `Qwen/Qwen3.5-2B-Base`
+- The old internal fallback encoder is no longer required for the normal path
+- Multiple live training runs completed with real Qwen backbone
+- Dashboard operational on port 8090
 
 ## Layout
 
 Key directories added in this fork:
 
 - `planner/`
-  - shared-backbone runtime
-  - state tokenizer and temporal compressor
-  - plan, value, and risk heads
-  - segment schemas and dataset helpers
+  - Shared-backbone runtime (`unified_backbone.py`)
+  - StateTokenizer: converts numeric sim state into learned frame tokens
+  - TemporalCompressor: GRU + attention pooling over frame buffer
+  - BackboneWrapper: runs real Qwen up to configured branch depth
+  - PlanHead (6 plan-code fields), ValueHead, RiskHead
+  - Segment schemas and dataset helpers
+  - Hindsight labeler for ground-truth plan codes from episode outcomes
 - `coach/`
-  - local JSON coach API
+  - Local JSON coach API for context-aware coaching during training
 - `dashboard/`
-  - LAN-accessible training dashboard
+  - LAN-accessible FastAPI training dashboard
+  - Live metrics, losses, entropy, Q values, throughput, planner latency
 - `qwen_runtime/`
-  - isolated Python `3.10` sidecar/runtime used during bring-up and model validation
+  - Isolated Python 3.10 sidecar used during bring-up and model validation
 
 Key entrypoints:
 
-- `train.py`
-  - main multi-episode trainer
-- `train_for_duration.py`
-  - wall-clock-limited trainer
-- `offline_build_segment_dataset.py`
-  - build segment records from stored laps
-- `offline_train_unified_backbone.py`
-  - offline backbone/head pretraining
+- `train.py` - main multi-episode trainer (`--algo shared_sac`)
+- `train_for_duration.py` - wall-clock-limited trainer
+- `offline_build_segment_dataset.py` - build segment records from stored laps
+- `offline_train_unified_backbone.py` - offline backbone/head pretraining
 
 ## Runtime Contract
 
 - Use `uv` for all Python commands
-- Main repo:
-  - `.python-version` = `3.10`
-  - `pyproject.toml` is the dependency source of truth
-  - `uv.lock` is committed
-- Preferred commands:
+- `.python-version` = `3.10`
+- `pyproject.toml` is the dependency source of truth
+- `uv.lock` is committed
+
+Preferred commands:
 
 ```powershell
 uv sync --extra planner --extra coach --group dev
@@ -59,43 +60,69 @@ uv run --no-sync python -m dashboard.app --outputs-root outputs --host 0.0.0.0 -
 
 The intended live path is:
 
-1. `StateTokenizer` converts numeric sim state into learned frame tokens.
-2. `TemporalCompressor` produces summary tokens.
-3. `BackboneWrapper` runs real Qwen up to the configured branch depth.
+1. `StateTokenizer` converts numeric sim state into learned frame tokens
+2. `TemporalCompressor` produces summary tokens from frame buffer (64 frames)
+3. `BackboneWrapper` runs real Qwen up to configured branch depth
 4. `SharedBackboneSAC` consumes:
-   - `z_mid`
-   - plan-code embeddings
-   - value/risk outputs
-   - projected current and delta observations
-5. SAC actor and Q heads on GPU1 produce the actual controls.
+   - `z_mid` (512-dim) from backbone branch layer
+   - Plan-code embeddings from PlanHead
+   - Value/risk outputs from auxiliary heads
+   - Projected current and delta observations
+5. FiLM-conditioned SAC actor and Q heads produce the actual controls
 
 Current practical default:
 
 - `Qwen/Qwen3.5-2B-Base`
-- `fp16`
-- backbone on `cuda:0`
+- `fp16` with 4-bit NF4 quantization
+- Backbone on `cuda:0`
 - SAC heads on `cuda:1`
+- LoRA adapters: rank 16, alpha 32
 
-`4B` loading works, but the current single-machine live loop has poorer latency margins. `2B` is the stable default until the hot-path latency is reduced further.
+`4B` loading works, but the current single-machine live loop has poorer latency margins. `2B` is the stable default until hot-path latency is reduced further.
+
+## Key Configuration (`config.yml`)
+
+```yaml
+UnifiedBackbone:
+  enabled: True
+  model_name: "Qwen/Qwen3.5-4B-Base"
+  fallback_model_name: "Qwen/Qwen3.5-2B-Base"
+  quantization: "4bit_nf4"
+  backbone_device_index: 0
+  head_device_index: 1
+  frame_buffer_len: 64
+  summary_token_count: 8
+  cache_refresh_hz: 5.0
+  branch_layer_4b: 16
+  branch_layer_2b: 12
+  lora_enabled: True
+  lora_rank: 16
+  lora_alpha: 32
+  lora_lr: 1e-5
+  head_lr: 3e-4
+  backbone_update_every: 100
+  student_distill_weight: 0.5
+  enable_grad_checkpointing: True
+```
 
 ## Important Fixes In This Fork
 
-- main repo moved from Python `3.9` to `3.10`
+- Main repo moved from Python `3.9` to `3.10`
 - `transformers` upgraded to a build that supports `qwen3_5`
-- shared-backbone loader now reads `Qwen3.5` config dimensions correctly
-- runtime no longer silently falls back because `hidden_size`/`num_hidden_layers` were `None`
-- checkpoint bundles save only local runtime modules, not full Qwen base weights
-- `train.py` now normalizes `work_dir` paths correctly
-- runtime dtype handling is fixed for `fp16` Qwen with `float32` SAC-side heads
-- mid-run backbone hot-swap is disabled to prevent hidden-size mismatches
+- Shared-backbone loader reads `Qwen3.5` config dimensions correctly
+- Runtime no longer silently falls back because `hidden_size`/`num_hidden_layers` were `None`
+- Checkpoint bundles save only local runtime modules, not full Qwen base weights
+- `train.py` normalizes `work_dir` paths correctly
+- Runtime dtype handling fixed for `fp16` Qwen with `float32` SAC-side heads
+- Mid-run backbone hot-swap disabled to prevent hidden-size mismatches
 
 ## Current Known Limits
 
-- planner latency is still high for live control:
-  - roughly `370-400 ms` p95 in the current `2B` run
-- the car still tends to fail on launch/reset and then overrun simple turns
-- launch-assist/control handoff remains the main environment-side instability
-- the hybrid path is functional, but policy quality is not yet competitive
+- Planner latency still high for live control (~370-400ms p95 with 2B)
+- Car fails simple turns and does not complete clean laps
+- Launch-assist / control handoff remains main environment-side instability
+- Policy quality not yet competitive with pure SAC baselines on reward
+- No run has completed a clean timed lap
 
 ## Dashboard
 
@@ -103,7 +130,7 @@ Dashboard entrypoint:
 
 - `dashboard/app.py`
 
-Expected usage:
+Usage:
 
 ```powershell
 uv run --no-sync python -m dashboard.app --outputs-root outputs --host 0.0.0.0 --port 8090
@@ -111,23 +138,16 @@ uv run --no-sync python -m dashboard.app --outputs-root outputs --host 0.0.0.0 -
 
 Main tabs:
 
-- `Overview`
-- `ML`
-- `Architecture`
-- `Training`
-- `Language`
-
-The `ML` tab is the main debugging view for:
-
-- losses
-- alpha / entropy / Q values
-- throughput
-- planner latency and confidence
-- run hyperparameters
+- Overview - process status
+- ML - losses, alpha, entropy, Q values, throughput
+- Architecture - model info, layer details
+- Training - hyperparameters, run config
+- Language - plan codes, backbone outputs
 
 ## Recommended Next Work
 
-1. Reduce shared-backbone latency before pushing longer live runs.
-2. Cache or amortize planner/backbone features more aggressively for replay updates.
-3. Fix launch-assist/reset reliability in the environment.
-4. Only then resume long-horizon Qwen + SAC training sweeps.
+1. Reduce shared-backbone latency (cache/amortize planner features for replay updates)
+2. Stabilize launch/reset behavior in the environment
+3. Change throttle/brake from relative to absolute control
+4. Add curriculum with hard-corner entry resets
+5. Resume longer real-Qwen training sweeps only after latency and reset improvements

@@ -1,5 +1,6 @@
 import os
 from contextlib import nullcontext
+import logging
 
 import torch
 from torch import nn
@@ -10,6 +11,8 @@ from .base import Algorithm
 from discor.utils import assert_action, disable_gradients, soft_update, update_params
 from planner.schemas import PLAN_CODE_SCHEMA
 from planner.unified_backbone import SharedBackboneRuntime
+
+logger = logging.getLogger(__name__)
 
 
 class FiLMLayer(nn.Module):
@@ -223,6 +226,57 @@ class SharedBackboneSAC(Algorithm):
         self._previous_state = None
         self._last_control_context = {}
 
+        # Backbone training config
+        self._backbone_update_every = int(self._cfg.get("backbone_update_every", 100))
+        self._student_distill_weight = float(self._cfg.get("student_distill_weight", 0.5))
+        self._backbone_optim = None
+        self._backbone_ce = nn.CrossEntropyLoss()
+        self._backbone_mse = nn.MSELoss()
+        self._backbone_bce = nn.BCELoss()
+
+        # Set up LoRA if configured
+        lora_enabled = bool(self._cfg.get("lora_enabled", False))
+        if lora_enabled and not self._freeze_backbone:
+            lora_rank = int(self._cfg.get("lora_rank", 16))
+            lora_alpha = int(self._cfg.get("lora_alpha", 32))
+            if self._runtime.encoder.backbone.enable_lora(rank=lora_rank, alpha=lora_alpha):
+                if bool(self._cfg.get("enable_grad_checkpointing", False)):
+                    self._runtime.encoder.backbone.enable_gradient_checkpointing()
+                self._setup_backbone_optimizer()
+
+    def _setup_backbone_optimizer(self):
+        """Create separate optimizer for backbone (LoRA + heads)."""
+        lora_lr = float(self._cfg.get("lora_lr", 1e-5))
+        head_lr = float(self._cfg.get("head_lr", 3e-4))
+
+        param_groups = []
+        # LoRA parameters (low LR)
+        lora_params = self._runtime.encoder.backbone.lora_parameters()
+        if lora_params:
+            param_groups.append({"params": lora_params, "lr": lora_lr})
+
+        # Head parameters (higher LR)
+        head_modules = [
+            self._runtime.encoder.state_tokenizer,
+            self._runtime.encoder.temporal_compressor,
+            self._runtime.plan_head,
+            self._runtime.value_head,
+            self._runtime.risk_head,
+            self._runtime.student,
+        ]
+        head_params = []
+        for module in head_modules:
+            head_params.extend([p for p in module.parameters() if p.requires_grad])
+        if head_params:
+            param_groups.append({"params": head_params, "lr": head_lr})
+
+        if param_groups:
+            self._backbone_optim = Adam(param_groups)
+            logger.info(
+                "Backbone optimizer created: %d LoRA params (lr=%.1e), %d head params (lr=%.1e)",
+                len(lora_params), lora_lr, len(head_params), head_lr,
+            )
+
     def reset_runtime_context(self, initial_state, env_info=None):
         self._previous_state = None
         self._runtime.reset(initial_state, env_info=env_info)
@@ -284,13 +338,16 @@ class SharedBackboneSAC(Algorithm):
         )
         return core, cond
 
-    def _batch_features(self, states, event_bits=None):
-        context = nullcontext() if not self._freeze_backbone else torch.no_grad()
-        with context:
-            encoded = self._runtime.encode_batch_states(states, event_bits=event_bits)
+    def _batch_features(self, states, event_bits=None, prev_states=None, enable_grad=False):
+        grad_context = nullcontext() if (not self._freeze_backbone or enable_grad) else torch.no_grad()
+        with grad_context:
+            encoded = self._runtime.encode_batch_states(states, event_bits=event_bits, enable_grad=enable_grad, prev_states=prev_states)
         z_mid = encoded["z_mid"].to(self._head_device)
         state_tensor = states.to(self._head_device)
-        delta_tensor = torch.zeros_like(state_tensor)
+        if prev_states is not None:
+            delta_tensor = state_tensor - prev_states.to(self._head_device)
+        else:
+            delta_tensor = torch.zeros_like(state_tensor)
         core = torch.cat([z_mid, self._obs_projection(state_tensor), self._delta_projection(delta_tensor)], dim=-1)
         plan_ids = {field_name: tensor.to(self._head_device) for field_name, tensor in encoded["plan_ids"].items()}
         cond = self._cond_encoder(
@@ -326,11 +383,14 @@ class SharedBackboneSAC(Algorithm):
         self._learning_steps += 1
         stats = self.update_policy_and_entropy(batch, writer)
         self.update_q_functions(batch, writer)
+        if hasattr(self, '_backbone_update_every') and self._learning_steps % self._backbone_update_every == 0:
+            self.update_backbone(batch, writer)
         return stats
 
     def update_policy_and_entropy(self, batch, writer):
-        states, actions, rewards, next_states, dones = batch
-        core, cond = self._batch_features(states)
+        states, actions, rewards, next_states, dones = batch[:5]
+        prev_states = batch[5] if len(batch) > 5 else None
+        core, cond = self._batch_features(states, prev_states=prev_states)
         sampled_actions, entropies, _ = self._policy_net(core, cond)
         qs1, qs2 = self._online_q_net(core, sampled_actions, cond)
         qs = torch.min(qs1, qs2)
@@ -360,9 +420,10 @@ class SharedBackboneSAC(Algorithm):
         return -torch.mean(self._log_alpha * (self._target_entropy - entropies))
 
     def update_q_functions(self, batch, writer):
-        states, actions, rewards, next_states, dones = batch
-        curr_core, curr_cond = self._batch_features(states)
-        next_core, next_cond = self._batch_features(next_states)
+        states, actions, rewards, next_states, dones = batch[:5]
+        prev_states = batch[5] if len(batch) > 5 else None
+        curr_core, curr_cond = self._batch_features(states, prev_states=prev_states)
+        next_core, next_cond = self._batch_features(next_states, prev_states=states)
         curr_qs1, curr_qs2 = self._online_q_net(curr_core, actions.to(self._head_device), curr_cond)
         with torch.no_grad():
             next_actions, next_entropies, _ = self._policy_net(next_core, next_cond)
@@ -381,6 +442,66 @@ class SharedBackboneSAC(Algorithm):
             writer.add_scalar("stats/mean_Q2", curr_qs2.detach().mean().item(), self._learning_steps)
         return curr_qs1.detach(), curr_qs2.detach(), target_qs
 
+    def update_backbone(self, batch, writer):
+        """Update backbone LoRA + heads with hindsight labels and student distillation."""
+        if self._backbone_optim is None:
+            return
+
+        states = batch[0]
+        prev_states = batch[5] if len(batch) > 5 else None
+
+        # Forward with gradients through LoRA
+        encoded = self._runtime.encode_batch_states(
+            states, enable_grad=True, prev_states=prev_states,
+        )
+        z_mid = encoded["z_mid"]
+        plan_logits = encoded["plan_logits"]
+        value_hat = encoded["value_hat"]
+        offtrack_prob = encoded["offtrack_prob"]
+
+        # Use actual returns from batch as value target (rewards are n-step discounted)
+        rewards = batch[2].to(z_mid.device)
+        value_loss = self._backbone_mse(value_hat, rewards)
+
+        # Use done signal as a proxy for offtrack (terminated episodes often = offtrack)
+        dones = batch[4].to(z_mid.device)
+        risk_loss = self._backbone_bce(offtrack_prob, dones)
+
+        # Plan head loss against hindsight labels if available
+        # For now, use the model's own argmax predictions as soft targets
+        # (will be replaced by hindsight labels from agent.py post-episode hook)
+        plan_loss = torch.tensor(0.0, device=z_mid.device)
+        if hasattr(self, '_cached_hindsight_targets') and self._cached_hindsight_targets is not None:
+            for i, field_name in enumerate(PLAN_CODE_SCHEMA.keys()):
+                if field_name in plan_logits:
+                    targets = self._cached_hindsight_targets[:, i].to(z_mid.device)
+                    plan_loss = plan_loss + self._backbone_ce(plan_logits[field_name], targets)
+
+        # Student distillation loss
+        student_out = self._runtime.student(states.to(self._runtime.backbone_device))
+        distill_loss = self._backbone_mse(student_out["z_mid"], z_mid.detach())
+
+        total_loss = value_loss + risk_loss + plan_loss + self._student_distill_weight * distill_loss
+
+        self._backbone_optim.zero_grad(set_to_none=True)
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            [p for group in self._backbone_optim.param_groups for p in group["params"]],
+            max_norm=1.0,
+        )
+        self._backbone_optim.step()
+
+        if self._learning_steps % (self._log_interval * 10) == 0:
+            writer.add_scalar("backbone/value_mse", value_loss.detach().item(), self._learning_steps)
+            writer.add_scalar("backbone/risk_bce", risk_loss.detach().item(), self._learning_steps)
+            writer.add_scalar("backbone/plan_ce", plan_loss.detach().item(), self._learning_steps)
+            writer.add_scalar("backbone/student_distill", distill_loss.detach().item(), self._learning_steps)
+            writer.add_scalar("backbone/total_loss", total_loss.detach().item(), self._learning_steps)
+
+    def set_hindsight_targets(self, targets: torch.Tensor):
+        """Cache hindsight plan code targets from post-episode labeling."""
+        self._cached_hindsight_targets = targets
+
     def save_models(self, save_dir):
         super().save_models(save_dir)
         self._runtime.save(os.path.join(save_dir, "shared_backbone_bundle.pth"))
@@ -390,6 +511,11 @@ class SharedBackboneSAC(Algorithm):
         torch.save(self._policy_net.state_dict(), os.path.join(save_dir, "policy_net.pth"))
         torch.save(self._online_q_net.state_dict(), os.path.join(save_dir, "online_q_net.pth"))
         torch.save(self._target_q_net.state_dict(), os.path.join(save_dir, "target_q_net.pth"))
+        # Save LoRA adapters if enabled
+        if self._runtime.encoder.backbone._lora_enabled:
+            lora_dir = os.path.join(save_dir, "lora_adapters")
+            os.makedirs(lora_dir, exist_ok=True)
+            self._runtime.encoder.backbone.save_lora(lora_dir)
 
     def load_models(self, load_dir):
         shared_bundle = os.path.join(load_dir, "shared_backbone_bundle.pth")
@@ -407,3 +533,9 @@ class SharedBackboneSAC(Algorithm):
         self._load_module_if_compatible(self._policy_net, os.path.join(load_dir, "policy_net.pth"))
         self._load_module_if_compatible(self._online_q_net, os.path.join(load_dir, "online_q_net.pth"))
         self._load_module_if_compatible(self._target_q_net, os.path.join(load_dir, "target_q_net.pth"))
+        # Load LoRA adapters if available
+        lora_dir = os.path.join(load_dir, "lora_adapters")
+        if os.path.exists(lora_dir):
+            self._runtime.encoder.backbone.load_lora(lora_dir)
+            if self._backbone_optim is None:
+                self._setup_backbone_optimizer()

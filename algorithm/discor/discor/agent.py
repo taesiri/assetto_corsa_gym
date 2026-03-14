@@ -219,6 +219,13 @@ class Agent:
         optimizer_updates_episode = 0
         live_update_time_s = 0.0
 
+        # Track episode data for hindsight labeling
+        ep_states = []
+        ep_rewards = []
+        ep_dones = []
+        ep_infos = []
+        prev_state = None
+
         try:
             done = False
             step_perf, action_perf, update_model_perf = [], [], []
@@ -284,11 +291,18 @@ class Agent:
 
                 self._replay_buffer.append(
                     state, action, reward, next_state, masked_done,
-                    episode_done=rb_done)
+                    episode_done=rb_done, prev_state=prev_state)
+
+                # Collect episode data for hindsight labeling
+                ep_states.append(state)
+                ep_rewards.append(reward)
+                ep_dones.append(done)
+                ep_infos.append(info if isinstance(info, dict) else {})
 
                 self._steps += 1
                 episode_steps += 1
                 episode_return += reward
+                prev_state = state
                 state = next_state
 
                 if self.checkpoint_freq and (self._steps % self.checkpoint_freq == 0):
@@ -298,6 +312,9 @@ class Agent:
             logger.exception("Agent TimeoutError")
         finally:
             env_ep_stats = self._env.close()
+
+        # Post-episode hindsight labeling
+        self._apply_hindsight_labels(ep_states, ep_rewards, ep_dones, ep_infos, episode_steps)
 
         env_ep_stats = env_ep_stats if isinstance(env_ep_stats, dict) else {}
         live_ep_time = time.time() - ep_start_time
@@ -395,6 +412,34 @@ class Agent:
             len(self._replay_buffer),
             episode_steps / max(live_ep_time, 1e-6),
         )
+
+    def _apply_hindsight_labels(self, ep_states, ep_rewards, ep_dones, ep_infos, episode_steps):
+        """Apply hindsight plan code labels to the replay buffer after an episode."""
+        if episode_steps == 0 or not hasattr(self._algo, "set_hindsight_targets"):
+            return
+        try:
+            from planner.hindsight_labeler import label_episode_hindsight, plan_ids_to_array
+            labels = label_episode_hindsight(
+                states=ep_states,
+                rewards=ep_rewards,
+                dones=ep_dones,
+                env_infos=ep_infos,
+                gamma=self._algo.gamma,
+            )
+            if not labels:
+                return
+            # Compute buffer indices for this episode's transitions
+            # They were the most recently added entries
+            buf = self._replay_buffer
+            n_labels = min(len(labels), buf._n)
+            if n_labels == 0:
+                return
+            end_idx = buf._p  # current write pointer (one past last written)
+            indices = np.arange(end_idx - n_labels, end_idx) % buf._memory_size
+            plan_arrays = np.stack([plan_ids_to_array(l) for l in labels[-n_labels:]])
+            buf.set_hindsight_labels(indices, plan_arrays)
+        except Exception:
+            logger.debug("Hindsight labeling skipped", exc_info=True)
 
     def evaluate(self):
         try:

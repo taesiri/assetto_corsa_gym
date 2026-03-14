@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 import logging
 import math
@@ -164,6 +165,7 @@ class BackboneWrapper(nn.Module):
         self._tokenizer = None
         self._hf_model = None
         self._can_generate = False
+        self._lora_enabled = False
         self.fallback_model = None
         self._load_model(model_name=self.model_name)
 
@@ -254,21 +256,91 @@ class BackboneWrapper(nn.Module):
             return
         self._activate_internal_fallback(reason=f"latency_or_reliability_fallback={self.fallback_model_name}")
 
-    def forward(self, inputs_embeds: torch.Tensor, require_top: bool = False) -> dict[str, torch.Tensor]:
+    def enable_lora(self, *, rank: int = 16, alpha: int = 32, target_modules: list[str] | None = None, dropout: float = 0.05) -> bool:
+        if self._hf_model is None:
+            logger.warning("Cannot enable LoRA: no HF model loaded")
+            return False
+        try:
+            from peft import LoraConfig, get_peft_model
+        except ImportError:
+            logger.warning("Cannot enable LoRA: peft not installed")
+            return False
+        if self._lora_enabled:
+            logger.info("LoRA already enabled, skipping")
+            return True
+        target_modules = target_modules or ["q_proj", "v_proj"]
+        lora_config = LoraConfig(
+            r=rank,
+            lora_alpha=alpha,
+            target_modules=target_modules,
+            lora_dropout=dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        self._hf_model = get_peft_model(self._hf_model, lora_config)
+        self._lora_enabled = True
+        trainable = sum(p.numel() for p in self._hf_model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self._hf_model.parameters())
+        logger.info("LoRA enabled: %d trainable / %d total params (%.2f%%)", trainable, total, 100.0 * trainable / max(total, 1))
+        return True
+
+    def enable_gradient_checkpointing(self) -> None:
+        if self._hf_model is None:
+            return
+        try:
+            model = self._hf_model.base_model if self._lora_enabled else self._hf_model
+            if hasattr(model, "gradient_checkpointing_enable"):
+                model.gradient_checkpointing_enable()
+                logger.info("Gradient checkpointing enabled on backbone")
+        except Exception as exc:
+            logger.warning("Failed to enable gradient checkpointing: %s", exc)
+
+    def lora_parameters(self) -> list[nn.Parameter]:
+        if not self._lora_enabled or self._hf_model is None:
+            return []
+        return [p for p in self._hf_model.parameters() if p.requires_grad]
+
+    def save_lora(self, path: str) -> None:
+        if not self._lora_enabled or self._hf_model is None:
+            logger.warning("Cannot save LoRA: not enabled or no model")
+            return
+        self._hf_model.save_pretrained(path)
+        logger.info("LoRA adapters saved to %s", path)
+
+    def load_lora(self, path: str) -> None:
+        if self._hf_model is None:
+            logger.warning("Cannot load LoRA: no HF model")
+            return
+        try:
+            from peft import PeftModel
+            if not self._lora_enabled:
+                self._hf_model = PeftModel.from_pretrained(self._hf_model, path)
+                self._lora_enabled = True
+            else:
+                from peft import set_peft_model_state_dict
+                import torch as _torch
+                adapters_weights = _torch.load(path + "/adapter_model.bin", map_location=self.device)
+                set_peft_model_state_dict(self._hf_model, adapters_weights)
+            logger.info("LoRA adapters loaded from %s", path)
+        except Exception as exc:
+            logger.exception("Failed to load LoRA adapters: %s", exc)
+
+    def forward(self, inputs_embeds: torch.Tensor, require_top: bool = False, *, enable_grad: bool = False) -> dict[str, torch.Tensor]:
         inputs_embeds = inputs_embeds.to(self.device)
         if self._hf_model is not None:
             model_dtype = next(self._hf_model.parameters()).dtype
             inputs_embeds = inputs_embeds.to(dtype=model_dtype)
-            with torch.no_grad():
+            context = nullcontext() if enable_grad else torch.no_grad()
+            with context:
                 outputs = self._hf_model(
                     inputs_embeds=inputs_embeds,
                     output_hidden_states=True,
                     use_cache=False,
                     return_dict=True,
                 )
-            hidden_states = list(outputs.hidden_states)
-            branch_hidden = hidden_states[self.branch_layer][:, -1, :]
-            top_hidden = hidden_states[-1][:, -1, :] if require_top else branch_hidden
+            all_hidden = outputs.hidden_states
+            branch_hidden = all_hidden[self.branch_layer][:, -1, :]
+            top_hidden = all_hidden[-1][:, -1, :] if require_top else branch_hidden
             return {"branch_hidden": branch_hidden, "top_hidden": top_hidden}
 
         hidden_states, last_hidden = self.fallback_model(inputs_embeds)
@@ -332,6 +404,7 @@ class UnifiedBackboneEncoder(nn.Module):
         task_ids: torch.Tensor | None = None,
         event_bits: torch.Tensor | None = None,
         require_top: bool = False,
+        enable_grad: bool = False,
     ) -> dict[str, torch.Tensor]:
         obs_seq = obs_seq.to(self.device)
         delta_seq = None if delta_seq is None else delta_seq.to(self.device)
@@ -339,7 +412,7 @@ class UnifiedBackboneEncoder(nn.Module):
         event_bits = None if event_bits is None else event_bits.to(self.device)
         frame_tokens = self.state_tokenizer(obs_seq, delta_seq=delta_seq, task_ids=task_ids, event_bits=event_bits)
         summary_tokens, state_summary = self.temporal_compressor(frame_tokens)
-        backbone_outputs = self.backbone(summary_tokens, require_top=require_top)
+        backbone_outputs = self.backbone(summary_tokens, require_top=require_top, enable_grad=enable_grad)
         z_mid = backbone_outputs["branch_hidden"].float()
         top_hidden = backbone_outputs["top_hidden"].float()
         return {
@@ -634,11 +707,16 @@ class SharedBackboneRuntime:
         task_ids: torch.Tensor | None = None,
         event_bits: torch.Tensor | None = None,
         require_top: bool = False,
+        enable_grad: bool = False,
+        prev_states: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if states.dim() != 2:
             raise ValueError("states must have shape [batch, state_dim]")
         obs_seq = states[:, None, :].to(self.backbone_device)
-        delta_seq = torch.zeros_like(obs_seq)
+        if prev_states is not None:
+            delta_seq = (states - prev_states)[:, None, :].to(self.backbone_device)
+        else:
+            delta_seq = torch.zeros_like(obs_seq)
         if event_bits is None:
             event_bits = torch.zeros(states.shape[0], 1, 6, dtype=torch.float32, device=self.backbone_device)
         elif event_bits.dim() == 2:
@@ -652,7 +730,7 @@ class SharedBackboneRuntime:
         else:
             task_ids = task_ids.to(self.backbone_device)
 
-        encoded = self.encoder(obs_seq, delta_seq=delta_seq, task_ids=task_ids, event_bits=event_bits, require_top=require_top)
+        encoded = self.encoder(obs_seq, delta_seq=delta_seq, task_ids=task_ids, event_bits=event_bits, require_top=require_top, enable_grad=enable_grad)
         z_mid = encoded["z_mid"]
         plan_logits = self.plan_head(z_mid)
         confidence, offtrack_prob = self.risk_head(z_mid)

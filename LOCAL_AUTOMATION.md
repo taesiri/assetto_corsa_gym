@@ -1,89 +1,118 @@
 # Local Automation Notes
 
-This file documents the local changes inside the nested gym checkout.
+This file documents the local changes inside the nested gym checkout at `C:\Workspace\RacingSim\assetto_corsa_gym`.
 
-The canonical end-to-end Windows setup guide now lives at:
-
+The canonical end-to-end Windows setup guide lives at:
 - [../docs/SETUP_AND_TRAINING.md](../docs/SETUP_AND_TRAINING.md)
 
-This file focuses on what was added or changed locally in this checkout.
+Current project status and training history:
+- [../docs/STATUS.md](../docs/STATUS.md)
+
+## Runtime
+
+This repo uses `uv` for Python environment management:
+
+- `.python-version` = `3.10`
+- `pyproject.toml` is the dependency source of truth
+- `uv.lock` is committed for reproducible installs
+
+Install:
+
+```powershell
+uv sync --extra planner --extra coach --group dev
+```
 
 ## Added Scripts
 
-- [smoke_random.py](C:/Workspace/RacingSim/assetto_corsa_gym/smoke_random.py)
-  - Live wiring smoke test against the running sim.
-- [live_train_watch.ps1](C:/Workspace/RacingSim/assetto_corsa_gym/live_train_watch.ps1)
-  - Waits for the plugin TCP port and then runs the smoke test followed by a short SAC job.
-- [plot_live_run.py](C:/Workspace/RacingSim/assetto_corsa_gym/plot_live_run.py)
-  - Exports `live_training_metrics.png`, `live_trajectory_overlay.png`, `live_scalars.csv`, and `live_run_summary.json` for a finished live run directory.
-- [train_for_duration.py](C:/Workspace/RacingSim/assetto_corsa_gym/train_for_duration.py)
-  - Trains for a fixed wall-clock duration, can resume from a saved model, can seed the replay buffer from prior lap files, and saves `replay_buffer.pkl` with the final checkpoint.
-- [offline_pretrain.py](C:/Workspace/RacingSim/assetto_corsa_gym/offline_pretrain.py)
-  - Short offline SAC pretrain against the public Hugging Face dataset with metrics and overlay plots.
+- [smoke_random.py](smoke_random.py) - Live wiring smoke test against the running sim
+- [train.py](train.py) - Main multi-episode trainer (supports `--algo shared_sac`)
+- [train_for_duration.py](train_for_duration.py) - Wall-clock-limited trainer with checkpoint resume and replay buffer seeding
+- [offline_pretrain.py](offline_pretrain.py) - Offline SAC pretrain against the public HuggingFace dataset
+- [offline_train_unified_backbone.py](offline_train_unified_backbone.py) - Offline Qwen + SAC backbone/head pretraining
+- [offline_build_segment_dataset.py](offline_build_segment_dataset.py) - Build segment records from stored laps
+- [plot_live_run.py](plot_live_run.py) - Exports metrics plots, scalars CSV, and summary JSON for a finished run
+- [live_experiment_sweep.py](live_experiment_sweep.py) - Multi-config experiment sweep automation
+- [curate_top_laps.py](curate_top_laps.py) - Top lap curation utility
+- [live_train_watch.ps1](live_train_watch.ps1) - Waits for plugin TCP port, then runs smoke + short SAC job
+
+## Added Directories
+
+- `planner/` - Unified Qwen backbone runtime
+  - `unified_backbone.py` - StateTokenizer, TemporalCompressor, BackboneWrapper, plan/value/risk heads
+  - `schemas.py` - Data structures for segments, plan codes, backbone outputs
+  - `segment_dataset.py` - Episode segmentation for hindsight labeling
+  - `hindsight_labeler.py` - Ground-truth plan code generation from episode outcomes
+- `coach/` - Local JSON coach API for context-aware coaching during training
+- `dashboard/` - FastAPI web dashboard for live training monitoring (port 8090)
+- `qwen_runtime/` - Isolated Python 3.10 sidecar for Qwen model validation and inference
 
 ## Local Code Changes
 
-- [ac_env.py](C:/Workspace/RacingSim/assetto_corsa_gym/assetto_corsa_gym/AssettoCorsaEnv/ac_env.py)
-  - Added post-reset launch assist. If AC respawns in neutral, the wrapper now holds throttle through vJoy until the automatic gearbox engages and the car starts rolling. If that fails, it falls back to the outer launcher script.
-- [sensors_par.py](C:/Workspace/RacingSim/assetto_corsa_gym/assetto_corsa_gym/AssettoCorsaPlugin/plugins/sensors_par/sensors_par.py)
-  - Added guards so the plugin can run even if CSP helper APIs are missing.
-- [WASD.ini](C:/Workspace/RacingSim/assetto_corsa_gym/assetto_corsa_gym/AssettoCorsaPlugin/windows-libs/WASD.ini)
-  - Removed stale vJoy bindings from the keyboard profile.
+- [ac_env.py](assetto_corsa_gym/AssettoCorsaEnv/ac_env.py)
+  - Added post-reset launch assist: holds throttle through vJoy until the automatic gearbox engages
+  - Action prior sampling, state-action bias, curvature-aware shaping
+  - Unified backbone guidance integration
+  - Overspeed / turn-gap / heading-error penalties
+  - Reference steering bias
+  - Teacher controller blending
+- [sensors_par.py](assetto_corsa_gym/AssettoCorsaPlugin/plugins/sensors_par/sensors_par.py)
+  - Added guards for missing CSP helper APIs
+- [WASD.ini](assetto_corsa_gym/AssettoCorsaPlugin/windows-libs/WASD.ini)
+  - Removed stale vJoy bindings from the keyboard profile
+- [agent.py](algorithm/discor/discor/agent.py)
+  - SharedBackboneSAC integration, post-episode update budget
+- [shared_backbone_sac.py](algorithm/discor/discor/algorithm/shared_backbone_sac.py)
+  - FiLM-conditioned SAC policy and Q-networks consuming backbone z_mid
+  - Plan-code embedding, confidence weighting
+- [replay_buffer.py](algorithm/discor/discor/replay_buffer.py)
+  - Extended for unified backbone (previous-state storage, segment metadata)
+- [config.yml](config.yml)
+  - Full UnifiedBackbone, Coach, Knowledge configuration blocks
+  - Action prior, reward shaping, teacher controller parameters
 
 ## Outer Launcher Script
 
 The stock-launcher automation lives outside this checkout at:
 
-- [start_acgym_supported.ps1](C:/Workspace/RacingSim/start_acgym_supported.ps1)
-- [scripts](C:/Workspace/RacingSim/scripts)
+- [start_acgym_supported.ps1](../start_acgym_supported.ps1)
+- [scripts/](../scripts/)
 
 That script:
 
-- detects the real AC config root under Documents / OneDrive,
-- forces `monza` + `ks_mazda_miata` Hotlap,
-- enables `sensors_par`,
-- copies the `Vjoy.ini` preset into the active `controls.ini`,
-- rewrites `PGUID0` to the currently enumerated live `vJoy Device` GUID,
-- forces the RDP-safe `1024x768` windowed render mode,
-- launches AC through the stock launcher,
-- dismisses the setup wizard if needed,
-- clicks through the stock launcher,
-- enters cockpit view,
-- clicks the in-session steering wheel icon so the car accepts drive input,
-- clicks back into the windshield area so the live session keeps focus.
-- can optionally skip the watcher with `-SkipWatcher`.
+- Detects the real AC config root under Documents / OneDrive
+- Forces `monza` + `ks_mazda_miata` Hotlap
+- Enables `sensors_par`
+- Copies the `Vjoy.ini` preset into the active `controls.ini`
+- Rewrites `PGUID0` to the currently enumerated live `vJoy Device` GUID
+- Forces the RDP-safe `1024x768` windowed render mode
+- Launches AC through the stock launcher
+- Dismisses the setup wizard if needed
+- Clicks through the stock launcher into Hotlap
+- Enters cockpit view
+- Clicks the in-session steering wheel icon so the car accepts drive input
+- Can optionally skip the watcher with `-SkipWatcher`
 
-The root wrapper scripts provide the normal operator entrypoints:
+Operator wrapper scripts:
 
-- [Run-Game.ps1](C:/Workspace/RacingSim/scripts/Run-Game.ps1)
-- [Smoke-Test.ps1](C:/Workspace/RacingSim/scripts/Smoke-Test.ps1)
-- [Train-LiveAgent.ps1](C:/Workspace/RacingSim/scripts/Train-LiveAgent.ps1)
-- [Resume-LiveAgent.ps1](C:/Workspace/RacingSim/scripts/Resume-LiveAgent.ps1)
-- [Plot-Run.ps1](C:/Workspace/RacingSim/scripts/Plot-Run.ps1)
-- [Launch-TurningTrain.ps1](C:/Workspace/RacingSim/scripts/Launch-TurningTrain.ps1)
-- [Run-ExperimentSweep.ps1](C:/Workspace/RacingSim/scripts/experimental/Run-ExperimentSweep.ps1)
+- [Run-Game.ps1](../scripts/Run-Game.ps1)
+- [Smoke-Test.ps1](../scripts/Smoke-Test.ps1)
+- [Train-LiveAgent.ps1](../scripts/Train-LiveAgent.ps1)
+- [Resume-LiveAgent.ps1](../scripts/Resume-LiveAgent.ps1)
+- [Plot-Run.ps1](../scripts/Plot-Run.ps1)
+- [Launch-TurningTrain.ps1](../scripts/Launch-TurningTrain.ps1)
+- [Start-QwenRuntime.ps1](../scripts/Start-QwenRuntime.ps1)
+- [Start-UnifiedDashboard.ps1](../scripts/Start-UnifiedDashboard.ps1)
+- [Run-ExperimentSweep.ps1](../scripts/experimental/Run-ExperimentSweep.ps1)
 
 ## Typical Flow
 
 Launch the game:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\start_acgym_supported.ps1
-```
-
-or:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Run-Game.ps1
+powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Run-Game.ps1 -SkipWatcher
 ```
 
 Smoke test:
-
-```powershell
-C:\Workspace\RacingSim\.venv-acgym\Scripts\python.exe C:\Workspace\RacingSim\assetto_corsa_gym\smoke_random.py
-```
-
-or:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Smoke-Test.ps1
@@ -92,52 +121,39 @@ powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Smoke-Te
 Short live SAC run:
 
 ```powershell
-C:\Workspace\RacingSim\.venv-acgym\Scripts\python.exe C:\Workspace\RacingSim\assetto_corsa_gym\train.py disable_wandb=True Agent.num_steps=20000 Agent.memory_size=50000 Agent.offline_buffer_size=0 Agent.start_steps=1000 Agent.batch_size=64 AssettoCorsa.track=monza AssettoCorsa.car=ks_mazda_miata
-```
-
-or with the generic live-agent wrapper:
-
-```powershell
 powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Train-LiveAgent.ps1 -Algo sac -NumSteps 20000
-powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Train-LiveAgent.ps1 -Algo discor -NumSteps 20000
 ```
 
-Plot a finished live run:
+Shared-backbone Qwen + SAC training:
 
 ```powershell
-C:\Workspace\RacingSim\.venv-acgym\Scripts\python.exe C:\Workspace\RacingSim\assetto_corsa_gym\plot_live_run.py --run-dir C:\Workspace\RacingSim\assetto_corsa_gym\outputs\RUN_DIR
+cd C:\Workspace\RacingSim\assetto_corsa_gym
+uv run --no-sync python train.py --algo shared_sac --config config.yml
 ```
 
-Continue training for a fixed time budget from an existing model:
-
-```powershell
-C:\Workspace\RacingSim\.venv-acgym\Scripts\python.exe C:\Workspace\RacingSim\assetto_corsa_gym\train_for_duration.py --load_path C:\Workspace\RacingSim\assetto_corsa_gym\outputs\RUN_DIR\model\final --duration-hours 3 --seed-laps-dir C:\Workspace\RacingSim\assetto_corsa_gym\outputs\RUN_DIR\laps disable_wandb=True AssettoCorsa.track=monza AssettoCorsa.car=ks_mazda_miata
-```
-
-or:
+Resume training for a fixed time:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Resume-LiveAgent.ps1 -Algo sac -DurationHours 3
 ```
 
-Current turning-focused continuation launcher:
+Start the dashboard:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Launch-TurningTrain.ps1
+powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Start-UnifiedDashboard.ps1
 ```
 
-## Verified Run Outputs
+Plot a finished run:
 
-- Short online sanity run:
-  - [20260311_125435.333](C:/Workspace/RacingSim/assetto_corsa_gym/outputs/20260311_125435.333)
-- Full 20k-step live SAC run:
-  - [20260311_125752.155](C:/Workspace/RacingSim/assetto_corsa_gym/outputs/20260311_125752.155)
-- 3-hour continuation run with replay buffer saved:
-  - [20260311_132637.378_duration](C:/Workspace/RacingSim/assetto_corsa_gym/outputs/20260311_132637.378_duration)
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Workspace\RacingSim\scripts\Plot-Run.ps1 -RunDir C:\Workspace\RacingSim\assetto_corsa_gym\outputs\RUN_DIR
+```
 
 ## Current Caveats
 
-- The setup is operational, but training is still noisy and can produce short bad episodes or physics outliers.
-- The live launcher automation is pixel-position based against the stock Assetto Corsa launcher on this machine, not a general menu automation framework.
-- `plot_live_run.py` works, but TensorBoard emits a harmless Windows path warning while loading the scalar file.
-- The most common setup failure mode was not the policy itself but the AC session overlay keeping the car in a non-driveable state; the outer launcher now handles that explicit handoff step.
+- Training is still noisy; short bad episodes and physics outliers occur
+- The live launcher automation is pixel-position based against the stock AC launcher on this machine
+- Planner latency is ~400ms p95 with the 2B model; still too high for tight control loops
+- Launch-assist / reset handoff remains the main environment-side instability
+- No run has completed a clean timed lap yet
+- `plot_live_run.py` works but TensorBoard emits a harmless Windows path warning
