@@ -12,7 +12,7 @@ Runtime:
 
 UnifiedBackbone:
   enabled: True
-  model_name: "Qwen/Qwen3.5-4B-Base"
+  model_name: "Qwen/Qwen3.5-2B-Base"
   fallback_model_name: "Qwen/Qwen3.5-2B-Base"
   quantization: "4bit_nf4"
   backbone_device_index: 0
@@ -27,13 +27,13 @@ UnifiedBackbone:
   coach_enabled: True
   coach_live_mode: False
   fallback_mode: "student_then_zero"
-  freeze_backbone: False
+  freeze_backbone: True
   lora_enabled: True
   lora_rank: 16
   lora_alpha: 32
   lora_lr: 1e-5
   head_lr: 3e-4
-  backbone_update_every: 1000
+  backbone_update_every: 200
   student_distill_weight: 0.5
   enable_grad_checkpointing: True
 

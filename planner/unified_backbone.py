@@ -761,7 +761,7 @@ class SharedBackboneRuntime:
         require_top: bool = False,
         enable_grad: bool = False,
         prev_states: torch.Tensor | None = None,
-        micro_batch_size: int = 16,
+        micro_batch_size: int = 4,
     ) -> dict[str, torch.Tensor]:
         if states.dim() != 2:
             raise ValueError("states must have shape [batch, state_dim]")

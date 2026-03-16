@@ -1,4 +1,5 @@
 import os
+import torch
 import pandas as pd
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
@@ -322,6 +323,7 @@ class Agent:
 
         # Flush any deferred backbone update before the replay burst
         if getattr(self._algo, '_backbone_update_pending', False) and len(self._replay_buffer) >= self._batch_size:
+            torch.cuda.empty_cache()
             batch = self._replay_buffer.sample(self._batch_size, self._device)
             self._algo.update_backbone(batch, self._writer)
             self._algo._backbone_update_pending = False

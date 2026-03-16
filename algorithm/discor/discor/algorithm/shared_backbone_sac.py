@@ -338,25 +338,43 @@ class SharedBackboneSAC(Algorithm):
         )
         return core, cond
 
-    def _batch_features(self, states, event_bits=None, prev_states=None, enable_grad=False):
-        grad_context = nullcontext() if (not self._freeze_backbone or enable_grad) else torch.no_grad()
-        with grad_context:
-            encoded = self._runtime.encode_batch_states(states, event_bits=event_bits, enable_grad=enable_grad, prev_states=prev_states)
-        z_mid = encoded["z_mid"].to(self._head_device)
+    def _batch_features(self, states, event_bits=None, prev_states=None, enable_grad=False, use_backbone=True):
+        B = states.shape[0]
         state_tensor = states.to(self._head_device)
         if prev_states is not None:
             delta_tensor = state_tensor - prev_states.to(self._head_device)
         else:
             delta_tensor = torch.zeros_like(state_tensor)
+
+        if use_backbone:
+            grad_context = nullcontext() if (not self._freeze_backbone or enable_grad) else torch.no_grad()
+            with grad_context:
+                encoded = self._runtime.encode_batch_states(states, event_bits=event_bits, enable_grad=enable_grad, prev_states=prev_states)
+            z_mid = encoded["z_mid"].to(self._head_device)
+            plan_ids = {field_name: tensor.to(self._head_device) for field_name, tensor in encoded["plan_ids"].items()}
+            value_hat = encoded["value_hat"].to(self._head_device)
+            confidence = encoded["confidence"].to(self._head_device)
+            offtrack_prob = encoded["offtrack_prob"].to(self._head_device)
+        else:
+            # Lightweight path: skip backbone forward, use zero z_mid + default plan codes.
+            # Policy/Q networks still get obs+delta projections which carry the state signal.
+            z_mid = torch.zeros(B, self._z_dim, dtype=torch.float32, device=self._head_device)
+            plan_ids = {
+                field_name: torch.zeros(B, dtype=torch.long, device=self._head_device)
+                for field_name in PLAN_CODE_SCHEMA.keys()
+            }
+            value_hat = torch.zeros(B, 1, dtype=torch.float32, device=self._head_device)
+            confidence = torch.zeros(B, 1, dtype=torch.float32, device=self._head_device)
+            offtrack_prob = torch.zeros(B, 1, dtype=torch.float32, device=self._head_device)
+
         core = torch.cat([z_mid, self._obs_projection(state_tensor), self._delta_projection(delta_tensor)], dim=-1)
-        plan_ids = {field_name: tensor.to(self._head_device) for field_name, tensor in encoded["plan_ids"].items()}
         cond = self._cond_encoder(
             plan_ids=plan_ids,
             z_mid=z_mid,
-            value_hat=encoded["value_hat"].to(self._head_device),
-            confidence=encoded["confidence"].to(self._head_device),
-            offtrack_prob=encoded["offtrack_prob"].to(self._head_device),
-            valid=torch.ones(states.shape[0], 1, dtype=torch.float32, device=self._head_device),
+            value_hat=value_hat,
+            confidence=confidence,
+            offtrack_prob=offtrack_prob,
+            valid=torch.ones(B, 1, dtype=torch.float32, device=self._head_device),
         )
         return core, cond
 
@@ -395,7 +413,7 @@ class SharedBackboneSAC(Algorithm):
     def update_policy_and_entropy(self, batch, writer):
         states, actions, rewards, next_states, dones = batch[:5]
         prev_states = batch[5] if len(batch) > 5 else None
-        core, cond = self._batch_features(states, prev_states=prev_states)
+        core, cond = self._batch_features(states, prev_states=prev_states, use_backbone=False)
         sampled_actions, entropies, _ = self._policy_net(core, cond)
         qs1, qs2 = self._online_q_net(core, sampled_actions, cond)
         qs = torch.min(qs1, qs2)
@@ -427,8 +445,8 @@ class SharedBackboneSAC(Algorithm):
     def update_q_functions(self, batch, writer):
         states, actions, rewards, next_states, dones = batch[:5]
         prev_states = batch[5] if len(batch) > 5 else None
-        curr_core, curr_cond = self._batch_features(states, prev_states=prev_states)
-        next_core, next_cond = self._batch_features(next_states, prev_states=states)
+        curr_core, curr_cond = self._batch_features(states, prev_states=prev_states, use_backbone=False)
+        next_core, next_cond = self._batch_features(next_states, prev_states=states, use_backbone=False)
         curr_qs1, curr_qs2 = self._online_q_net(curr_core, actions.to(self._head_device), curr_cond)
         with torch.no_grad():
             next_actions, next_entropies, _ = self._policy_net(next_core, next_cond)
@@ -455,7 +473,7 @@ class SharedBackboneSAC(Algorithm):
         states = batch[0]
         prev_states = batch[5] if len(batch) > 5 else None
 
-        # Forward with gradients through LoRA
+        # Forward with gradients through LoRA (if not frozen)
         encoded = self._runtime.encode_batch_states(
             states, enable_grad=True, prev_states=prev_states,
         )
@@ -473,8 +491,6 @@ class SharedBackboneSAC(Algorithm):
         risk_loss = self._backbone_bce(offtrack_prob, dones)
 
         # Plan head loss against hindsight labels if available
-        # For now, use the model's own argmax predictions as soft targets
-        # (will be replaced by hindsight labels from agent.py post-episode hook)
         plan_loss = torch.tensor(0.0, device=z_mid.device)
         if hasattr(self, '_cached_hindsight_targets') and self._cached_hindsight_targets is not None:
             for i, field_name in enumerate(PLAN_CODE_SCHEMA.keys()):
