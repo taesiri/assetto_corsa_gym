@@ -482,11 +482,38 @@ class AssettoCorsaEnv(Env, gym_utils.EzPickle):
             for ch in self.obs_enabled_channels:
                 logger.info("%s: scale %f" % (ch, self.obs_channels_info[ch]))
 
+        # Build full observation channel name list (matches get_obs order)
+        self._full_obs_channel_names = self._build_full_obs_channel_names()
+
         # needed for stable baselines
         self.reward_range = (-np.inf, np.inf)
         self.metadata = {'render.modes': ['human', 'rgb_array'], 'video.frames_per_second': 30}
 
         self.is_metaworld = False
+
+    def _build_full_obs_channel_names(self):
+        """Build the full list of observation channel names matching get_obs() order."""
+        base = list(self.obs_enabled_channels)
+        if self.enable_sensors:
+            base += [f"ray_{i}" for i in range(self.sensors.number_of_rays)]
+        names = list(base)
+        names.append("offtrack")
+        names += [f"curvature_{i}" for i in range(CURV_LOOK_AHEAD_VECTOR_SIZE)]
+        names += [f"prev_steer_{i}" for i in range(PAST_ACTIONS_WINDOW)]
+        names += [f"prev_throttle_{i}" for i in range(PAST_ACTIONS_WINDOW)]
+        names += [f"prev_brake_{i}" for i in range(PAST_ACTIONS_WINDOW)]
+        names += ["steer", "throttle", "brake"]
+        if self.add_previous_obs_to_state:
+            for w in range(PAST_ACTIONS_WINDOW):
+                names += [f"{ch}_t{w+1}" for ch in base]
+        if self.config.enable_task_id_in_obs:
+            n_tasks = self.tasks_ids.get_number_of_tasks()
+            names += [f"task_{i}" for i in range(n_tasks)]
+        return names
+
+    @property
+    def full_obs_channel_names(self):
+        return self._full_obs_channel_names
 
     def sample_exploration_action(self):
         if not self.use_action_prior_sampling:

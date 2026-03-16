@@ -6,7 +6,7 @@ task: AssettoCorsaGym
 seed: 0
 
 Runtime:
-  cuda_device_index: 1
+  cuda_device_index: 0
   low_fi_training: True
   profile_mode: False
 
@@ -16,7 +16,7 @@ UnifiedBackbone:
   fallback_model_name: "Qwen/Qwen3.5-2B-Base"
   quantization: "4bit_nf4"
   backbone_device_index: 0
-  head_device_index: 1
+  head_device_index: 0
   frame_buffer_len: 64
   summary_token_count: 8
   cache_refresh_hz: 5.0

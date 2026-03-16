@@ -5,6 +5,37 @@ import json
 from typing import Any, Iterable
 
 
+# Observation channel names matching the exact order in ac_env.py:get_obs().
+# Config: enable_sensors=True (11 rays), add_previous_obs_to_state=True (3 windows),
+# use_target_speed=False, enable_task_id_in_obs=False.  Total = 125 dims.
+def build_obs_channel_names(*, n_rays: int = 11, past_window: int = 3,
+                            use_target_speed: bool = False) -> list[str]:
+    base = [
+        "speed", "gap", "last_ff", "rpm", "accel_x", "accel_y",
+        "gear", "yaw_rate", "velocity_x", "velocity_y",
+        "slip_fl", "slip_fr", "slip_rl", "slip_rr",
+    ]
+    if n_rays > 0:
+        base += [f"ray_{i}" for i in range(n_rays)]
+
+    names: list[str] = list(base)
+    names.append("offtrack")
+    names += [f"curvature_{i}" for i in range(12)]
+    names += [f"prev_steer_{i}" for i in range(past_window)]
+    names += [f"prev_throttle_{i}" for i in range(past_window)]
+    names += [f"prev_brake_{i}" for i in range(past_window)]
+    names += ["steer", "throttle", "brake"]
+    # Previous observations (past_window copies of base channels)
+    for w in range(past_window):
+        names += [f"{ch}_t{w+1}" for ch in base]
+    if use_target_speed:
+        names += [f"target_speed_{i}" for i in range(12)]
+    return names
+
+
+OBS_CHANNEL_NAMES_DEFAULT = build_obs_channel_names()
+
+
 PLAN_CODE_SCHEMA = {
     "speed_mode": ("conserve", "nominal", "push"),
     "brake_phase": ("early", "nominal", "late", "emergency"),

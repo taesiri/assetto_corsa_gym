@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 import logging
 import math
+import threading
 import time
 from typing import Any
 
@@ -12,7 +13,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .schemas import DEFAULT_PLAN_CODE, PLAN_CODE_SCHEMA, UnifiedBackboneOutput, canonicalize_plan_code, plan_code_from_ids
+from .schemas import DEFAULT_PLAN_CODE, OBS_CHANNEL_NAMES_DEFAULT, PLAN_CODE_SCHEMA, UnifiedBackboneOutput, canonicalize_plan_code, plan_code_from_ids
 
 logger = logging.getLogger(__name__)
 
@@ -508,13 +509,14 @@ class RuntimeCache:
     output: UnifiedBackboneOutput
     step_index: int
     event_bits: list[float]
+    narration: str = ""
 
 
 class SharedBackboneRuntime:
     def __init__(self, *, state_dim: int, config: dict[str, Any], max_tasks: int, obs_channel_names: list[str] | None = None) -> None:
         self.config = dict(config)
         self.state_dim = int(state_dim)
-        self.obs_channel_names = list(obs_channel_names or [])
+        self.obs_channel_names = list(obs_channel_names or OBS_CHANNEL_NAMES_DEFAULT)
         self.backbone_device = _safe_torch_device(
             f"cuda:{int(self.config.get('backbone_device_index', 0))}" if torch.cuda.is_available() else "cpu"
         )
@@ -547,6 +549,13 @@ class SharedBackboneRuntime:
         self._latency_window_ms: deque[float] = deque(maxlen=256)
         self._confidence_window: deque[float] = deque(maxlen=256)
         self._fallback_mode = str(self.config.get("fallback_mode", "student_then_zero"))
+
+        # Async backbone refresh — decouple inference from control loop
+        self._refresh_lock = threading.Lock()
+        self._refresh_pending = threading.Event()
+        self._shutdown = threading.Event()
+        self._refresh_thread = threading.Thread(target=self._worker_loop, daemon=True, name="backbone-refresh")
+        self._refresh_thread.start()
 
     def freeze_backbone(self) -> None:
         for module in (self.encoder, self.plan_head, self.value_head, self.risk_head, self.student):
@@ -595,8 +604,12 @@ class SharedBackboneRuntime:
         self._event_buffer.append(np.asarray(self.build_event_bits(env_info), dtype=np.float32))
         self._task_buffer.append(self.task_id_from_info(env_info))
         self._step_index += 1
-        if force_refresh or self._should_refresh(env_info):
+        if force_refresh:
+            # Synchronous refresh only on episode reset (first observation)
             self._refresh_cache()
+        elif self._should_refresh(env_info):
+            # Non-blocking: signal background thread to refresh
+            self._refresh_pending.set()
         return self.latest_output()
 
     def _should_refresh(self, env_info: dict[str, Any] | None) -> bool:
@@ -655,7 +668,20 @@ class SharedBackboneRuntime:
         output.latency_ms = float((time.perf_counter() - start) * 1000.0)
         self._latency_window_ms.append(output.latency_ms)
         self._confidence_window.append(output.confidence)
-        self._cache = RuntimeCache(output=output, step_index=self._step_index, event_bits=list(self._event_buffer[-1]) if self._event_buffer else [0.0] * 6)
+
+        # Build narration from the latest frame
+        narration = ""
+        if self._frame_buffer:
+            narration = self._narrate_state(self._frame_buffer[-1], output)
+
+        with self._refresh_lock:
+            self._cache = RuntimeCache(
+                output=output,
+                step_index=self._step_index,
+                event_bits=list(self._event_buffer[-1]) if self._event_buffer else [0.0] * 6,
+                narration=narration,
+            )
+
         if len(self._latency_window_ms) >= 32:
             latency_p95 = float(np.quantile(np.asarray(self._latency_window_ms, dtype=np.float32), 0.95))
             if latency_p95 > 120.0:
@@ -663,6 +689,25 @@ class SharedBackboneRuntime:
                     "Planner latency p95 %.2f ms exceeds threshold, but runtime backbone switching is disabled after init to keep hidden sizes stable.",
                     latency_p95,
                 )
+
+    def _worker_loop(self) -> None:
+        """Background thread: waits for refresh signal, runs backbone inference."""
+        while not self._shutdown.is_set():
+            self._refresh_pending.wait(timeout=1.0)
+            self._refresh_pending.clear()
+            if self._shutdown.is_set():
+                break
+            try:
+                self._refresh_cache()
+            except Exception:
+                logger.debug("Background backbone refresh failed", exc_info=True)
+
+    def shutdown(self) -> None:
+        """Stop the background refresh thread."""
+        self._shutdown.set()
+        self._refresh_pending.set()  # wake up worker so it can exit
+        if self._refresh_thread.is_alive():
+            self._refresh_thread.join(timeout=5.0)
 
     def _student_or_zero_fallback(self) -> UnifiedBackboneOutput:
         if self._fallback_mode != "student_then_zero" or not self._frame_buffer:
@@ -684,9 +729,16 @@ class SharedBackboneRuntime:
         )
 
     def latest_output(self) -> UnifiedBackboneOutput:
-        if self._cache is None:
-            return UnifiedBackboneOutput(plan_code=dict(DEFAULT_PLAN_CODE), planner_version="empty_cache", valid=False)
-        return self._cache.output
+        with self._refresh_lock:
+            if self._cache is None:
+                return UnifiedBackboneOutput(plan_code=dict(DEFAULT_PLAN_CODE), planner_version="empty_cache", valid=False)
+            return self._cache.output
+
+    def latest_narration(self) -> str:
+        with self._refresh_lock:
+            if self._cache is None:
+                return ""
+            return self._cache.narration
 
     def latest_control_context(self) -> dict[str, Any]:
         output = self.latest_output()
@@ -808,12 +860,69 @@ class SharedBackboneRuntime:
         if "student" in state:
             self.student.load_state_dict(self._compatible_state_dict(self.student, state["student"]), strict=False)
 
+    def _narrate_state(self, state: np.ndarray, output: UnifiedBackboneOutput) -> str:
+        """Convert raw observation + backbone output into a human-readable narration."""
+        s = state
+        n = len(self.obs_channel_names)
+        parts: list[str] = []
+
+        # Extract key telemetry by channel name if available
+        ch = {}
+        if n > 0 and len(s) >= n:
+            for i, name in enumerate(self.obs_channel_names[:len(s)]):
+                ch[name] = float(s[i])
+        elif len(s) >= 14:
+            # Fallback: use positional indices for the 14 base channels
+            _base = ["speed", "gap", "last_ff", "rpm", "accel_x", "accel_y",
+                     "gear", "yaw_rate", "velocity_x", "velocity_y",
+                     "slip_fl", "slip_fr", "slip_rl", "slip_rr"]
+            for i, name in enumerate(_base):
+                ch[name] = float(s[i])
+
+        if not ch:
+            return ""
+
+        # Speed and gap
+        speed_ms = ch.get("speed", 0.0)
+        speed_kph = speed_ms * 3.6
+        gap = ch.get("gap", 0.0)
+        gear = int(round(ch.get("gear", 0.0)))
+        parts.append(f"Speed {speed_kph:.0f} km/h (gear {gear}), gap {gap:+.2f}m from racing line.")
+
+        # Curvature trend
+        curv_vals = [ch.get(f"curvature_{i}", 0.0) for i in range(12)]
+        max_curv = max(abs(c) for c in curv_vals) if curv_vals else 0.0
+        if max_curv > 0.08:
+            direction = "left" if sum(curv_vals[:6]) > 0 else "right"
+            parts.append(f"Approaching {'tight' if max_curv > 0.15 else 'moderate'} {direction} turn (peak curvature {max_curv:.3f}).")
+        else:
+            parts.append("Straight or gentle curve ahead.")
+
+        # Slip / stability
+        slip_rl = abs(ch.get("slip_rl", 0.0))
+        slip_rr = abs(ch.get("slip_rr", 0.0))
+        rear_slip = max(slip_rl, slip_rr)
+        if rear_slip > 2.0:
+            parts.append(f"Rear slip angle {rear_slip:.1f} deg — {'heavy' if rear_slip > 5.0 else 'light'} oversteer.")
+
+        # Plan code and predictions
+        pc = output.plan_code
+        parts.append(
+            f"Plan: {pc.get('speed_mode','?')}/{pc.get('brake_phase','?')}/{pc.get('line_mode','?')}, "
+            f"stability={pc.get('stability_mode','?')}, recovery={pc.get('recovery_mode','?')}. "
+            f"Value={output.value_hat:.2f}, risk={pc.get('risk_mode','?')}, confidence={output.confidence:.2f}."
+        )
+        return " ".join(parts)
+
     def generate_coach_response(self, *, question: str, segment_summary: dict[str, Any], evidence_segments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         evidence_segments = evidence_segments or []
         evidence_ids = [segment.get("segment_id", "") for segment in evidence_segments[:4] if segment.get("segment_id")]
         plan_code = canonicalize_plan_code(segment_summary.get("plan_code"))
+        narration = self.latest_narration()
+        narration_block = f"Current state: {narration}\n" if narration else ""
         prompt = (
             "You are a grounded racing coach. Answer in 2-3 sentences using only the supplied telemetry evidence.\n"
+            f"{narration_block}"
             f"Question: {question}\nPlan code: {plan_code}\nEvidence ids: {evidence_ids}\nSummary: {segment_summary}\n"
         )
         generated = self.encoder.backbone.generate_text(prompt)

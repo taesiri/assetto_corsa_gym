@@ -118,7 +118,7 @@ def main():
             device=device,
             seed=config.seed,
             unified_backbone_config=OmegaConf.to_container(config.UnifiedBackbone),
-            obs_channel_names=getattr(env, "obs_enabled_channels", None),
+            obs_channel_names=getattr(env, "full_obs_channel_names", None) or getattr(env, "obs_enabled_channels", None),
             task_id_dim=getattr(getattr(env, "tasks_ids", None), "num_tasks", 1),
             control_delta_dim=int(getattr(config.UnifiedBackbone, "control_delta_dim", 128)),
             **OmegaConf.to_container(config.SAC),
