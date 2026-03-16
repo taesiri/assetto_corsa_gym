@@ -761,22 +761,57 @@ class SharedBackboneRuntime:
         require_top: bool = False,
         enable_grad: bool = False,
         prev_states: torch.Tensor | None = None,
+        micro_batch_size: int = 16,
     ) -> dict[str, torch.Tensor]:
         if states.dim() != 2:
             raise ValueError("states must have shape [batch, state_dim]")
+        B = states.shape[0]
+
+        # Process in micro-batches to avoid OOM on large batches with gradients
+        if B > micro_batch_size and enable_grad:
+            chunks = []
+            for start in range(0, B, micro_batch_size):
+                end = min(start + micro_batch_size, B)
+                chunk_result = self.encode_batch_states(
+                    states[start:end],
+                    task_ids=task_ids[start:end] if task_ids is not None else None,
+                    event_bits=event_bits[start:end] if event_bits is not None else None,
+                    require_top=require_top,
+                    enable_grad=enable_grad,
+                    prev_states=prev_states[start:end] if prev_states is not None else None,
+                    micro_batch_size=micro_batch_size,
+                )
+                chunks.append(chunk_result)
+            # Concatenate all micro-batch results
+            merged: dict[str, Any] = {}
+            for key in chunks[0]:
+                if key == "plan_logits":
+                    field_names = list(chunks[0]["plan_logits"].keys())
+                    merged["plan_logits"] = {
+                        fn: torch.cat([c["plan_logits"][fn] for c in chunks], dim=0) for fn in field_names
+                    }
+                elif key == "plan_ids":
+                    field_names = list(chunks[0]["plan_ids"].keys())
+                    merged["plan_ids"] = {
+                        fn: torch.cat([c["plan_ids"][fn] for c in chunks], dim=0) for fn in field_names
+                    }
+                else:
+                    merged[key] = torch.cat([c[key] for c in chunks], dim=0)
+            return merged
+
         obs_seq = states[:, None, :].to(self.backbone_device)
         if prev_states is not None:
             delta_seq = (states - prev_states)[:, None, :].to(self.backbone_device)
         else:
             delta_seq = torch.zeros_like(obs_seq)
         if event_bits is None:
-            event_bits = torch.zeros(states.shape[0], 1, 6, dtype=torch.float32, device=self.backbone_device)
+            event_bits = torch.zeros(B, 1, 6, dtype=torch.float32, device=self.backbone_device)
         elif event_bits.dim() == 2:
             event_bits = event_bits[:, None, :].to(self.backbone_device)
         else:
             event_bits = event_bits.to(self.backbone_device)
         if task_ids is None:
-            task_ids = torch.zeros(states.shape[0], 1, dtype=torch.long, device=self.backbone_device)
+            task_ids = torch.zeros(B, 1, dtype=torch.long, device=self.backbone_device)
         elif task_ids.dim() == 1:
             task_ids = task_ids[:, None].to(self.backbone_device)
         else:
