@@ -379,12 +379,17 @@ class SharedBackboneSAC(Algorithm):
     def update_target_networks(self):
         soft_update(self._target_q_net, self._online_q_net, self._target_update_coef)
 
-    def update_online_networks(self, batch, writer):
+    def update_online_networks(self, batch, writer, *, source: str = "live"):
         self._learning_steps += 1
         stats = self.update_policy_and_entropy(batch, writer)
         self.update_q_functions(batch, writer)
         if hasattr(self, '_backbone_update_every') and self._learning_steps % self._backbone_update_every == 0:
-            self.update_backbone(batch, writer)
+            if source == "post_episode":
+                # Only run expensive backbone gradient updates between episodes
+                self.update_backbone(batch, writer)
+            else:
+                # Defer backbone update — it will run in post-episode replay burst
+                self._backbone_update_pending = True
         return stats
 
     def update_policy_and_entropy(self, batch, writer):

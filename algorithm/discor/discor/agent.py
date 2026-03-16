@@ -149,7 +149,7 @@ class Agent:
 
         for _ in range(updates_to_run):
             batch = self._replay_buffer.sample(self._batch_size, self._device)
-            train_stats = self._algo.update_online_networks(batch, self._writer)
+            train_stats = self._algo.update_online_networks(batch, self._writer, source=source)
             optimizer_updates += 1
             self._optimizer_updates_total += 1
             if source == "post_episode":
@@ -319,6 +319,12 @@ class Agent:
         env_ep_stats = env_ep_stats if isinstance(env_ep_stats, dict) else {}
         live_ep_time = time.time() - ep_start_time
         self._optimizer_update_time_total_s += live_update_time_s
+
+        # Flush any deferred backbone update before the replay burst
+        if getattr(self._algo, '_backbone_update_pending', False) and len(self._replay_buffer) >= self._batch_size:
+            batch = self._replay_buffer.sample(self._batch_size, self._device)
+            self._algo.update_backbone(batch, self._writer)
+            self._algo._backbone_update_pending = False
 
         post_episode_update = self.run_replay_update_burst(
             max_seconds=self._post_episode_update_budget_s,

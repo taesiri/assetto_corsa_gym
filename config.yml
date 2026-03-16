@@ -33,7 +33,7 @@ UnifiedBackbone:
   lora_alpha: 32
   lora_lr: 1e-5
   head_lr: 3e-4
-  backbone_update_every: 100
+  backbone_update_every: 1000
   student_distill_weight: 0.5
   enable_grad_checkpointing: True
 
